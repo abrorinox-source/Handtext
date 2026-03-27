@@ -1,6 +1,7 @@
 import os
 from copy import deepcopy
 import time
+import threading
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import requests
@@ -9,6 +10,7 @@ import logging
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw
 from io import BytesIO
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # .env faylini yuklash
 load_dotenv()
@@ -1839,6 +1841,41 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xatolarni log qilish"""
     logger.error(f"Update {update} caused an error: {context.error}")
 
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP handler for Render/UptimeRobot health checks."""
+
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        body = b"not found"
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        """Reduce noisy HTTP access logs in the bot output."""
+        return
+
+
+def start_healthcheck_server():
+    """Start a tiny HTTP server so Render and UptimeRobot can check liveness."""
+    port = int(os.getenv("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"Health check server started on port {port}")
+    return server
+
 def main():
     """Botni ishga tushirish"""
     # Bot tokenini olish
@@ -1849,6 +1886,8 @@ def main():
         print("Please set TELEGRAM_BOT_TOKEN in the .env file or as an environment variable.")
         return
     
+    start_healthcheck_server()
+
     # Application yaratish
     application = Application.builder().token(TOKEN).build()
     
