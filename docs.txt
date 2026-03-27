@@ -1,0 +1,1374 @@
+Getting Started
+Introduction
+Generate realistic handwritten PNGs and print-ready PDFs from plain text.
+
+HandTextAI turns plain text into realistic handwriting for cards, letters, and envelopes.
+​
+Base URL
+All public API endpoints are under:
+https://api.handtextai.com/api/v1
+​
+What you can do
+Generate PNG (transparent background) for easy overlay and digital use
+Generate PDF (white background) for print workflows (crop/bleed/trim boxes, PDF/X-1a option)
+Preview your settings with a watermarked 1200px-wide PNG
+Fetch the font catalog via numeric font_id values (1–90)
+Run Batch Generation (CSV + templates) via the dashboard (Batch Generation)
+​
+Key concepts (important)
+Authentication: send your API key as a Bearer token (Authorization: Bearer htext_...).
+Single-page output: the renderer produces a single page. If your text overflows the available content height, remaining lines are not rendered.
+DPI scaling rule: all pixel parameters (margins, font sizes, spacing) are specified at a 300 DPI baseline and automatically scaled when you set dpi: 600.
+Next: head to the Quickstart or open the API Reference tab.
+Getting Started
+Quickstart
+Get an API key and generate your first handwriting output in minutes.
+
+​
+1) Get an API key
+Create an API key in the HandTextAI dashboard and copy the value (it starts with htext_).
+​
+2) Generate a PNG
+For the most predictable production output, start with font_id: 1 or 2 and validate your final settings with /preview before you ship.
+curl
+Python
+JavaScript
+curl -sS https://api.handtextai.com/api/v1/generate \
+  -H "Authorization: Bearer htext_YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Hello from HandTextAI!",
+    "font_id": 1,
+    "font_size": "auto",
+    "page_size": "a4",
+    "dpi": 300
+  }' \
+  | python3 - <<'PY'
+import sys, json, base64
+payload = json.load(sys.stdin)
+img = base64.b64decode(payload["image_base64"])
+open("output.png", "wb").write(img)
+print("Saved output.png (request_id:", payload.get("request_id"), ")")
+PY
+​
+3) Preview before you generate (free)
+Use /preview to iterate on margins/font sizing quickly. Previews are watermarked and free.
+curl
+Python
+JavaScript
+curl -sS https://api.handtextai.com/api/v1/preview \
+  -H "Authorization: Bearer htext_YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello!", "font_id": 1, "font_size": "auto", "page_size": "a4"}'
+​
+4) Generate a PDF
+PDF responses are binary, not JSON.
+curl
+Python
+JavaScript
+curl -sS https://api.handtextai.com/api/v1/generate \
+  -H "Authorization: Bearer htext_YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Hello from HandTextAI!",
+    "font_id": 1,
+    "font_size": "auto",
+    "page_size": "letter",
+    "output_format": "pdf"
+  }' \
+  -o output.pdf
+​
+5) Handle rate limits
+When you hit rate limits, use the Retry-After header:
+Python
+JavaScript
+import time
+
+def generate_with_retry(request_data, max_retries=3):
+    for attempt in range(max_retries):
+        response = requests.post(
+            "https://api.handtextai.com/api/v1/generate",
+            headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+            json=request_data,
+        )
+
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 60))
+            print(f"Rate limited, waiting {retry_after}s...")
+            time.sleep(retry_after)
+            continue
+
+        return response
+
+    raise Exception("Max retries exceeded")
+​
+Need to generate many outputs?
+Use the dashboard’s Batch Generation for CSV-based bulk processing.
+​
+Troubleshooting
+Error	Cause	Solution
+401	Invalid API key	Check Authorization: Bearer htext_... format
+422	Validation error	Check details array in response for field errors
+429	Rate/quota limit	Wait for Retry-After seconds, then retry
+See Errors & Rate Limits for complete error reference.
+
+Getting Started
+Authentication
+Use your HandTextAI API key with standard Bearer authentication.
+
+All endpoints except GET /api/v1/status require an API key.
+​
+Header format
+Authorization: Bearer htext_your_api_key
+​
+API key notes
+API keys are tied to your account and are rate-limited
+Keys start with htext_ prefix
+Manage your keys in the dashboard
+​
+Request tracking with X-Request-ID
+You can include your own X-Request-ID header for request correlation:
+X-Request-ID: my-app-12345-request-001
+Best practices:
+Use a unique value per request (UUID recommended)
+Include your app name or context for easier debugging
+The API echoes back your ID in the response X-Request-ID header
+If you don’t provide one, the API generates a UUID automatically
+This is useful for:
+Correlating requests in your application logs
+Referencing specific requests when contacting support
+Tracing requests across your infrastructure
+
+Guides
+Generate PNG
+Generate a high-quality PNG with a transparent background.
+
+Use POST /api/v1/generate with output_format: "png" (default).
+​
+Minimal request
+{
+  "text": "Hello!",
+  "font_id": 1,
+  "font_size": "auto",
+  "page_size": "a4",
+  "dpi": 300
+}
+​
+Response
+The response is JSON:
+{
+  "request_id": "550e8400-e29b-41d4-a716-446655440000",
+  "image_base64": "iVBORw0KGgoAAAANS...",
+  "width": 2480,
+  "height": 3508,
+  "calculated_font_size": 42,
+  "processing_time_ms": 523.7,
+  "characters_processed": 150
+}
+Field	Description
+request_id	Unique identifier for this request (use for support)
+image_base64	Base64-encoded PNG with transparent background
+width, height	Pixel dimensions of the generated page
+calculated_font_size	The font size used (returned when font_size: "auto")
+processing_time_ms	Server processing time in milliseconds
+characters_processed	Number of characters in your submitted text (after API normalization). Useful for debugging/metrics (billing is per request, not per character).
+​
+Tips
+Use max_auto_font_size to prevent overly large text for very short content.
+If you render at dpi: 600, keep setting margins/sizes as if they were 300 DPI — the server scales them automatically.
+The renderer outputs one page (no pagination). Choose page_size + margins accordingly.
+
+Guides
+Generate PDF
+Generate a print-ready PDF (binary response) with optional prepress settings.
+
+Use POST /api/v1/generate with output_format: "pdf".
+​
+Important differences vs PNG
+Response is binary application/pdf (not JSON).
+PDF has a white background (no transparency).
+​
+Basic PDF example
+curl -sS https://api.handtextai.com/api/v1/generate \
+  -H "Authorization: Bearer htext_YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Hello from HandTextAI!",
+    "font_id": 1,
+    "font_size": "auto",
+    "page_size": "letter",
+    "dpi": 300,
+    "output_format": "pdf",
+    "pdf": { "preset": "generic" }
+  }' \
+  -o output.pdf
+​
+PDF options (pdf object)
+These options are accepted only when output_format="pdf":
+preset: generic (default), lob, click2mail
+standard: pdf (default) or pdfx1a (CMYK PDF/X-1a:2001)
+icc_profile: auto, gracol_2013, gracol_2006, pso_coated_v3, iso_coated_v2 (PDF/X-1a only)
+profile: document, press, auto (standard PDF only)
+region: auto, us, eu
+bleed_mm: override bleed (mm)
+crop_box: media, bleed, trim
+​
+Provider presets
+​
+Lob (strict preflight)
+{
+  "output_format": "pdf",
+  "pdf": { "preset": "lob" }
+}
+​
+Click2Mail (portal-friendly)
+{
+  "output_format": "pdf",
+  "pdf": { "preset": "click2mail" }
+}
+
+
+
+Guides
+PDF & Prepress
+Understanding PDF output options, presets, and print-ready settings.
+
+When generating PDF output (output_format: "pdf"), you can configure prepress settings for professional printing.
+​
+Quick start
+For most use cases, one of the presets handles everything:
+{
+  "text": "Hello!",
+  "font_id": 1,
+  "page_size": "postcard_us",
+  "output_format": "pdf",
+  "pdf": {
+    "preset": "generic"
+  }
+}
+​
+Presets
+Presets bundle common settings for specific use cases.
+​
+generic (default)
+Standard PDF output for most uses:
+RGB color space
+White background (no transparency)
+Bleed/crop marks are controlled by pdf.profile (defaults to document)
+Use for: General downloads, archiving, non-print workflows.
+If you want the API to automatically choose press for trimmed products (postcards/cards) and document for letters, set pdf.profile: "auto".
+​
+lob
+Optimized for Lob.com print API:
+Forces PDF/X-1a (CMYK)
+Includes bleed on trimmed products (postcards, cards)
+No crop marks (Lob handles trimming)
+GRACoL 2013 ICC profile (US), PSO Coated v3 (EU)
+Use for: Lob.com direct mail integration.
+{
+  "output_format": "pdf",
+  "pdf": {
+    "preset": "lob"
+  }
+}
+​
+click2mail
+Optimized for Click2Mail:
+Standard PDF (not PDF/X-1a)
+No crop marks or slug (clean edges)
+Larger bleed for US trimmed products (6.35mm / 0.25”)
+Press profile for postcards, document profile for letters
+Use for: Click2Mail portal uploads.
+{
+  "output_format": "pdf",
+  "pdf": {
+    "preset": "click2mail"
+  }
+}
+​
+PDF standards
+​
+pdf (default)
+Standard PDF with RGB color:
+Compatible with all PDF viewers
+White background
+Supports profile/region/bleed options
+​
+pdfx1a
+PDF/X-1a:2001 for strict print preflight:
+CMYK color only (Ghostscript conversion)
+No transparency
+Embedded ICC profile
+Required by some commercial printers
+{
+  "pdf": {
+    "standard": "pdfx1a"
+  }
+}
+The lob preset automatically sets standard: "pdfx1a". You don’t need to specify both.
+​
+ICC profiles
+For PDF/X-1a output, choose an ICC profile for color conversion:
+Profile	Region	Description
+auto	—	US → GRACoL 2013, EU → PSO Coated v3
+gracol_2013	US	GRACoL 2013 (recommended for US print)
+gracol_2006	US	Legacy GRACoL 2006
+pso_coated_v3	EU	PSO Coated v3 (recommended for EU print)
+iso_coated_v2	EU	ISO Coated v2 (alternative EU profile)
+{
+  "pdf": {
+    "standard": "pdfx1a",
+    "icc_profile": "gracol_2013"
+  }
+}
+​
+Profiles
+For standard PDF output, the profile controls bleed and crop marks:
+​
+document
+Clean page with no print production marks:
+No bleed area
+No crop marks
+Page size matches paper size exactly
+This is the default (pdf.profile defaults to document).
+​
+auto
+Automatically chooses a sensible profile based on page size:
+press for trimmed products: postcard_us, card_5x7, card_a2, square_5x5, card_96x135
+document for letters/envelopes and other formats
+{
+  "pdf": {
+    "profile": "auto"
+  }
+}
+​
+press
+Print-ready with bleed and trim guides:
+Includes bleed area around content
+Adds crop marks for trimming
+Includes slug area for marks
+Use this when you need print production marks and bleed (common for postcards/cards).
+{
+  "pdf": {
+    "profile": "press"
+  }
+}
+​
+Bleed settings
+Bleed is extra content area that extends beyond the trim line, ensuring no white edges after cutting.
+​
+Regional defaults
+When profile is press and bleed is not specified:
+Region	Default bleed
+US	3.175mm (1/8 inch)
+EU	3.0mm
+​
+Custom bleed
+Override with bleed_mm:
+{
+  "pdf": {
+    "profile": "press",
+    "bleed_mm": 5.0
+  }
+}
+​
+Region
+Region affects default bleed, ICC profile selection, and crop mark style:
+Region	Bleed	ICC Profile	Crop marks
+us	1/8” (3.175mm)	GRACoL 2013	1/4” length
+eu	3mm	PSO Coated v3	5mm length
+​
+Auto-detection
+When region: "auto" (default):
+ISO sizes (a3, a4, a5, a6, dl, card_96x135) → eu
+US sizes (letter, legal, postcard_us, etc.) → us
+​
+Crop box
+Controls the visible area in PDF viewers:
+Value	Description
+media	Shows entire page including crop marks (default)
+bleed	Crops to BleedBox (hides marks, shows bleed)
+trim	Crops to TrimBox (final product size)
+{
+  "pdf": {
+    "profile": "press",
+    "crop_box": "trim"
+  }
+}
+​
+PDF boxes explained
+PDF prepress uses several box definitions:
+┌─────────────────────────────────┐
+│  MediaBox (full page + marks)   │
+│  ┌────────────────────────┐     │
+│  │  BleedBox (+ bleed)    │     │
+│  │  ┌─────────────────┐   │     │
+│  │  │  TrimBox        │   │     │
+│  │  │  (final size)   │   │     │
+│  │  │                 │   │     │
+│  │  └─────────────────┘   │     │
+│  └────────────────────────┘     │
+└─────────────────────────────────┘
+TrimBox: The intended final product size
+BleedBox: TrimBox plus bleed area
+MediaBox: Full page including crop marks and slug
+​
+Examples
+​
+Postcard for Lob
+{
+  "text": "Thank you for your order!",
+  "font_id": 1,
+  "page_size": "postcard_us",
+  "output_format": "pdf",
+  "pdf": {
+    "preset": "lob"
+  }
+}
+​
+A4 letter for download
+{
+  "text": "Dear valued customer...",
+  "font_id": 2,
+  "page_size": "a4",
+  "output_format": "pdf"
+}
+​
+Press-ready greeting card
+{
+  "text": "Happy Birthday!",
+  "font_id": 3,
+  "page_size": "card_5x7",
+  "output_format": "pdf",
+  "pdf": {
+    "profile": "press",
+    "region": "us",
+    "bleed_mm": 3.175
+  }
+}
+
+Guides
+Preview (Watermarked)
+Generate a watermarked preview to test settings before final generation.
+
+Use POST /api/v1/preview.
+​
+What preview does
+Always returns a PNG response as JSON (image_base64)
+Applies a watermark
+Scales output to 1200px width while keeping aspect ratio
+​
+Notes
+output_format must be "png" (use /generate for PDFs).
+Preview is ideal for tuning margins, font sizing, and page selection before generating final output.
+If you enable random effects (rotation/variation/indentation) or try less-tested fonts, run preview multiple times to confirm the layout remains within your safe area.
+
+
+Guides
+Tuning Output
+Learn what each request parameter does and how to get the best results.
+
+This page explains the most important GenerateRequest parameters used by both /generate and /preview.
+If you prefer a complete field-by-field schema, see the API Reference tab (generated from OpenAPI).
+​
+Text input
+text supports:
+\\n for a new line
+\\n\\n for a paragraph break
+The API normalizes whitespace per line (multiple spaces are collapsed), then trims the final text.
+​
+Sizing & layout
+​
+Page size, orientation, and DPI
+page_size: a4, letter, postcard_us, envelope_10, etc. (see Page Sizes & DPI)
+orientation: portrait or landscape
+dpi: 300 or 600
+​
+DPI scaling rule (critical)
+All pixel parameters are defined at a 300 DPI baseline.
+If you set dpi: 600, the service scales margins/font size/spacing so the physical output stays the same.
+​
+Font sizing
+font_size:
+"auto" (default) auto-fits the text to the available content area
+an integer 12–400 (manual size)
+max_auto_font_size: caps the font size used by auto-fit (useful for short text on large pages)
+​
+Margins (pixels @ 300 DPI)
+margin_left, margin_right, margin_top, margin_bottom
+Defaults are 240px which is roughly 20mm at 300 DPI.
+​
+Line layout
+line_height_multiplier (default 2.0): bigger numbers increase line spacing
+line_break_spacing (optional): extra spacing between paragraphs; null lets the server choose
+​
+Word spacing
+word_spacing adds extra pixels between words (useful for “looser” handwriting).
+​
+Visual effects
+All effects are optional and off by default (except kerning).
+Effects like word rotation, natural variation, and random indentation are intentionally non-deterministic. Combined with different font metrics (each font has different letter spacing and line geometry), some font/effect combinations can occasionally render closer to the margins than expected or clip near edges on a single page. Always validate your exact font_id + settings using /preview before production.
+​
+Kerning
+kerning (default true) adjusts letter pairs (e.g., “AV”, “To”) for more natural spacing.
+​
+Rotation
+enable_word_rotation enables subtle word rotation
+word_rotation_range controls max rotation angle (degrees)
+​
+Natural handwriting variation
+enable_natural_variation applies smooth, elastic-like distortion
+natural_variation_alpha controls intensity (typical: 10–40)
+natural_variation_sigma controls smoothness (typical: 3–8)
+​
+Random indentation
+enable_random_indentation adds random horizontal indentation to lines
+indentation_range controls the max indentation
+​
+Ink flow
+enable_ink_flow adds ink fading/flow artifacts
+ink_flow_intensity controls strength (0–3)
+​
+Color and alignment
+text_alignment: left or center
+text_color: [R, G, B] (e.g., [0, 0, 0] for black)
+
+
+Guides
+Batch Generation
+Generate many outputs at once using CSV + templates (dashboard feature).
+
+Batch generation is designed for producing many letters/cards/addresses in one run.
+Today, batch generation is primarily a dashboard feature (it runs through session-authenticated endpoints under /client/*, not the public /api/v1/* API).
+If you need batch generation via API-key auth, contact support.
+​
+How it works
+Upload a CSV.
+Write a template using {variable} placeholders.
+Pick output type:
+zip_png — a ZIP of PNG pages
+zip_pdf — a ZIP of per-row PDFs
+combined_pdf — one PDF containing all pages (merged in order)
+The server creates a batch job and generates up to a few preview rows.
+A background worker claims queued jobs and produces the final artifacts.
+​
+CSV + template rules
+CSV must include a header row.
+Column names are normalized:
+trimmed, lowercased
+spaces/hyphens become underscores
+non [a-z0-9_] characters become underscores
+Template variables use {variable_name} syntax and are normalized the same way.
+​
+Example: Thank you cards
+CSV file:
+first_name,order_number,product
+Sarah,ORD-12345,Blue Ceramic Vase
+Michael,ORD-12346,Wooden Photo Frame
+Template:
+Dear {first_name},
+
+Thank you so much for your recent order ({order_number}). We hope you love your {product}!
+
+With gratitude,
+The HandCraft Team
+​
+Example: Address labels
+CSV file:
+name,street,city,state,zip
+John Smith,123 Main Street,Springfield,IL,62701
+Jane Doe,456 Oak Avenue,Chicago,IL,60601
+Template:
+{name}
+{street}
+{city}, {state} {zip}
+If a row is missing any required variable values, it is skipped and recorded in the batch report.
+​
+Limits and retention
+Maximum rows: 5,000 per batch job
+Output retention: Files are available for download for 7 days after generation
+File size: Large batches may take several minutes to process
+​
+Recommended approach
+Use /preview first to lock in a good set of GenerateRequest settings.
+Use batch for “production runs” once settings are stable.
+For address work, use generation_type: "address" and manual font_size (auto is not supported).
+
+
+Guides
+Address Mode
+Generate envelope addresses with stricter constraints.
+
+Set generation_type: "address" when generating envelope addresses.
+​
+Constraints
+Max 5 lines (split by \\n)
+Max 250 characters
+font_size: "auto" is not supported — you must set a numeric font size (12–400)
+​
+Example
+{
+  "generation_type": "address",
+  "page_size": "envelope_10",
+  "font_id": 1,
+  "font_size": 44,
+  "text": "Jane Doe\\n123 Main St\\nSpringfield, IL 62704"
+}
+
+
+Guides
+Page Sizes & DPI
+Supported page sizes and how DPI scaling works.
+
+HandTextAI renders a single page using a fixed page size and orientation.
+​
+Supported page sizes
+Use page_size with one of these values:
+​
+ISO (A-series)
+page_size	mm (W×H)	px @ 300 DPI	px @ 600 DPI
+a3	297×420	3508×4961	7016×9921
+a4	210×297	2480×3508	4960×7016
+a5	148×210	1748×2480	3496×4961
+a6	105×148	1240×1748	2480×3496
+​
+US paper
+page_size	inches (W×H)	px @ 300 DPI	px @ 600 DPI
+letter	8.5×11	2550×3300	5100×6600
+legal	8.5×14	2550×4200	5100×8400
+half_letter	5.5×8.5	1650×2550	3300×5100
+​
+Cards
+page_size	inches / mm (W×H)	px @ 300 DPI	px @ 600 DPI
+postcard_us	4×6	1200×1800	2400×3600
+card_5x7	5×7	1500×2100	3000×4200
+card_a2	4.25×5.5	1275×1650	2550×3300
+square_5x5	5×5	1500×1500	3000×3000
+card_96x135	96×135mm	1134×1594	2268×3189
+​
+Envelopes (content sizes)
+page_size	inches / mm (W×H)	px @ 300 DPI	px @ 600 DPI
+dl	99×210mm	1169×2480	2338×4960
+envelope_10	4.125×9.5	1238×2850	2476×5700
+envelope_monarch	3.875×7.5	1163×2250	2326×4500
+​
+Orientation
+Set orientation: "landscape" to swap width and height.
+​
+DPI scaling rule (critical)
+All pixel parameters (margins, font size, spacing) are specified at a 300 DPI baseline.
+If you set dpi: 600, the service automatically scales these values so the output matches the same real-world physical size.
+
+
+
+Guides
+Fonts
+Browse the font catalog and choose the right font for your use case.
+
+The API includes 90 handwriting fonts with varying styles and language support.
+​
+Fetching the catalog
+curl -sS https://api.handtextai.com/api/v1/fonts \
+  -H "Authorization: Bearer htext_YOUR_KEY"
+Response:
+{
+  "fonts": [
+    {
+      "id": 1,
+      "supported_languages": ["en", "fr", "de", "ru", "uk", ...]
+    },
+    ...
+  ]
+}
+​
+Key points
+Font IDs are numeric (1–90)
+The API does not expose font names (intentional for licensing)
+Each font has supported_languages (BCP-47 codes)
+​
+Reliability notes (important)
+For most production use cases, we recommend starting with font IDs 1 or 2. They are the most widely tested across page sizes, DPI, and typical parameter combinations.
+Other fonts are supported, but handwriting fonts vary significantly in their glyph metrics (character widths, ascenders/descenders, line spacing, and kerning). In addition, some “natural” effects intentionally apply small random shifts/rotations. Because you’re rendering into a fixed page area (margins + single page), certain font/effect combinations can occasionally:
+look slightly different between requests (by design, when randomness is enabled)
+fit tighter than expected for some text
+touch margins or clip near edges in extreme cases
+This is not something that can be made perfect for every font and every parameter combination, because the underlying font geometry and layout behavior differs.
+Recommendation: Before going to production, use /preview with representative text (and run it multiple times if you enable random effects). Once you find a stable combination for your use case, lock the font_id + settings in your config.
+​
+Recommended workflow
+​
+1. Filter by language
+If your text includes non-Latin characters, filter fonts by language:
+response = requests.get(
+    "https://api.handtextai.com/api/v1/fonts",
+    headers={"Authorization": f"Bearer {API_KEY}"},
+)
+fonts = response.json()["fonts"]
+
+# Find fonts supporting Russian
+russian_fonts = [f for f in fonts if "ru" in f["supported_languages"]]
+print(f"Found {len(russian_fonts)} fonts with Russian support")
+​
+2. Test with preview
+Use the free /preview endpoint to test fonts visually:
+for font_id in [1, 2, 3, 4, 5]:
+    response = requests.post(
+        "https://api.handtextai.com/api/v1/preview",
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+        json={"text": "Sample text", "font_id": font_id, "font_size": 48, "page_size": "a5"},
+    )
+    # Save previews to compare styles
+    save_preview(response.json(), f"font_{font_id}.png")
+​
+3. Lock your choice
+Once you find a font you like, save the font_id in your config:
+PREFERRED_FONT_ID = 3  # Lock this after testing
+​
+Language support
+​
+Common language codes
+Code	Language	Notes
+en	English	All fonts
+de	German	Most fonts
+fr	French	Most fonts
+es	Spanish	Most fonts
+ru	Russian	Cyrillic fonts only
+uk	Ukrainian	Cyrillic fonts only
+el	Greek	Limited fonts
+ja	Japanese	Very limited
+hi	Hindi	Limited fonts
+​
+Finding Cyrillic-capable fonts
+cyrillic_fonts = [
+    f["id"] for f in fonts
+    if "ru" in f["supported_languages"] or "uk" in f["supported_languages"]
+]
+​
+FAQ
+​
+Why are some characters missing?
+The font doesn’t support those characters. Solutions:
+Check language support — Use /fonts to find a font that supports your language
+Stick to supported characters — Filter or validate input before sending
+Use a fallback font — Try font 1 (broad coverage) or font 10 (includes Japanese/Greek)
+​
+Why does my text look different than expected?
+Fonts have different styles:
+Some are more formal/cursive
+Some are more casual/print-like
+Line height and spacing vary
+Use /preview to test before committing.
+​
+Which font should I use for…
+Use case	Suggested fonts	Why
+Professional letters	1, 2, 3	Clean, readable
+Greeting cards	4, 5, 6	Friendly, casual
+Multi-language (Cyrillic)	1	Broad coverage
+Multi-language (Japanese)	10	CJK support
+​
+How do I match a specific handwriting style?
+There’s no way to search by style. Use this approach:
+Generate previews for all 90 fonts (takes ~90 preview calls)
+Compare visually
+Narrow down to 3-5 candidates
+Test with real content
+Lock your final choice
+​
+Can I upload my own font?
+Not currently. The API uses a curated set of licensed fonts.
+
+
+
+
+Reference
+Request Schema
+Complete reference for all request parameters.
+
+All parameters for POST /api/v1/generate and POST /api/v1/preview.
+All pixel values (margins, font sizes, spacing) are specified at 300 DPI baseline. When using dpi: 600, the API automatically scales them to maintain physical dimensions.
+​
+Required parameters
+Parameter	Type	Description
+text	string	Text to render. 1-10,000 characters. Use \n for line breaks, \n\n for paragraphs.
+​
+Content parameters
+Parameter	Type	Default	Range	Description
+font_id	integer	1	1-90	Font identifier. See fonts guide.
+font_size	int or "auto"	"auto"	12-400	Font size in pixels, or "auto" for automatic sizing.
+max_auto_font_size	integer	200	20-400	Maximum size when using auto-fit. Prevents oversized text on short content.
+generation_type	string	"standard"	—	"standard" or "address". Address mode has constraints (see below).
+​
+Page layout
+Parameter	Type	Default	Range	Description
+page_size	string	"a4"	—	Page format. See page sizes guide.
+orientation	string	"portrait"	—	"portrait" or "landscape".
+dpi	integer	300	300, 600	Output resolution.
+margin_left	integer	240	0-5000	Left margin in pixels (~20mm at 300 DPI).
+margin_right	integer	240	0-5000	Right margin in pixels.
+margin_top	integer	240	0-5000	Top margin in pixels.
+margin_bottom	integer	240	0-5000	Bottom margin in pixels.
+​
+Text styling
+Parameter	Type	Default	Range	Description
+text_alignment	string	"left"	—	"left" or "center".
+text_color	array	null	0-255 each	RGB color as [R, G, B] (defaults to black if omitted).
+kerning	boolean	true	—	Enable letter pair kerning for natural spacing.
+line_height_multiplier	float	2.0	0.5-4.0	Line height as multiplier of font size.
+line_break_spacing	integer	auto	0-500	Extra spacing between paragraphs (after \n\n).
+word_spacing	integer	0	0-3000	Extra pixels between words.
+​
+Natural effects
+All effects are disabled by default. Enable each with its boolean flag.
+​
+Word rotation
+Parameter	Type	Default	Range	Description
+enable_word_rotation	boolean	false	—	Enable slight word angle variations.
+word_rotation_range	float	5.0	0-10	Maximum rotation angle in degrees.
+​
+Natural variation
+Elastic deformation that makes letters less uniform.
+Parameter	Type	Default	Range	Description
+enable_natural_variation	boolean	false	—	Enable letter displacement effect.
+natural_variation_alpha	integer	15	0-100	Deformation intensity. 10-40 typical.
+natural_variation_sigma	integer	5	0-10	Deformation smoothness. Use ≥3 with high alpha.
+​
+Random indentation
+Parameter	Type	Default	Range	Description
+enable_random_indentation	boolean	false	—	Enable random line start variation.
+indentation_range	integer	20	0-100	Maximum indentation in pixels.
+​
+Ink flow
+Simulates ink fading/running out.
+Parameter	Type	Default	Range	Description
+enable_ink_flow	boolean	false	—	Enable ink fade effect.
+ink_flow_intensity	float	1.0	0-3.0	Fade intensity.
+​
+Output options
+Parameter	Type	Default	Description
+output_format	string	"png"	"png" (JSON with base64) or "pdf" (binary response).
+pdf	object	—	PDF options (only when output_format: "pdf"). See PDF guide.
+​
+PDF options
+Only applies when output_format: "pdf".
+Parameter	Type	Default	Description
+pdf.preset	string	"generic"	"generic", "lob", "click2mail".
+pdf.standard	string	"pdf"	"pdf" (RGB) or "pdfx1a" (CMYK).
+pdf.icc_profile	string	"auto"	ICC profile for PDF/X-1a.
+pdf.profile	string	"document"	"document", "press", "auto".
+pdf.region	string	"auto"	"us", "eu", "auto".
+pdf.bleed_mm	float	auto	Bleed in mm (0-20).
+pdf.crop_box	string	"media"	"media", "bleed", "trim".
+​
+Address mode constraints
+When generation_type: "address":
+Constraint	Limit
+Maximum lines	5
+Maximum characters	250
+Font sizing	Manual only (no "auto")
+Example:
+{
+  "text": "John Smith\n123 Main Street\nAnytown, ST 12345",
+  "generation_type": "address",
+  "font_size": 48,
+  "page_size": "envelope_10"
+}
+​
+DPI scaling
+All pixel values are at 300 DPI baseline. At 600 DPI:
+300 DPI	600 DPI	Physical
+240px	480px	~20mm
+100px	200px	~8.5mm
+1200px	2400px	~102mm
+You don’t need to change values when switching DPI — the API scales automatically.
+​
+Complete example
+{
+  "text": "Dear valued customer,\n\nThank you for your order!",
+  "font_id": 3,
+  "font_size": "auto",
+  "max_auto_font_size": 150,
+  "page_size": "card_5x7",
+  "orientation": "portrait",
+  "dpi": 300,
+  "margin_left": 180,
+  "margin_right": 180,
+  "margin_top": 200,
+  "margin_bottom": 200,
+  "text_alignment": "left",
+  "text_color": [20, 20, 80],
+  "kerning": true,
+  "line_height_multiplier": 2.2,
+  "enable_word_rotation": true,
+  "word_rotation_range": 3.0,
+  "enable_natural_variation": true,
+  "natural_variation_alpha": 20,
+  "natural_variation_sigma": 5,
+  "output_format": "png"
+}
+
+
+
+Reference
+HTTP Headers
+Request and response headers used by the HandTextAI API.
+
+​
+Request headers
+​
+Authorization (required)
+Authorization: Bearer htext_your_api_key
+Required for all endpoints except GET /api/v1/status.
+​
+X-Request-ID (optional)
+X-Request-ID: your-unique-request-id
+Supply your own request identifier for correlation. The API echoes it back in the response. If omitted, the API generates a UUID.
+Recommended format: {app-name}-{uuid} or plain UUID.
+​
+Response headers
+​
+X-Request-ID
+Always present. Contains either your supplied ID or an API-generated UUID.
+X-Request-ID: 550e8400-e29b-41d4-a716-446655440000
+​
+X-Process-Time
+Processing time in seconds (3 decimal places):
+X-Process-Time: 0.523
+​
+Rate limit headers
+Present on authenticated endpoints after the rate-limit check runs:
+Header	Description	Example
+X-RateLimit-Limit	Max requests in window	500
+X-RateLimit-Remaining	Requests left in window	499
+X-RateLimit-Reset	Unix timestamp of reset	1704067200
+If a /generate request is rejected due to a monthly quota (REQUEST_LIMIT_EXCEEDED), the response may not include X-RateLimit-* headers because quota checks happen before rate limiting.
+​
+Retry-After
+Only on rate-limit 429 responses (RATE_LIMIT_EXCEEDED). Seconds to wait before retrying:
+Retry-After: 45
+For quota 429 responses (REQUEST_LIMIT_EXCEEDED), do not retry immediately — wait for the quota reset or increase your quota.
+​
+Content-Disposition (PDF only)
+For PDF responses, includes a suggested filename:
+Content-Disposition: inline; filename="handtext_a4_300dpi.pdf"
+​
+Handling rate limits
+When you receive a 429 response:
+Check the JSON error field:
+RATE_LIMIT_EXCEEDED: read Retry-After (seconds) and retry after waiting
+REQUEST_LIMIT_EXCEEDED: you’re out of quota — wait for reset or upgrade
+Implement exponential backoff for repeated RATE_LIMIT_EXCEEDED responses
+Example retry logic (pseudocode):
+def request_with_retry(url, headers, max_retries=3):
+    for attempt in range(max_retries):
+        response = requests.post(url, headers=headers)
+
+        if response.status_code == 429:
+            retry_after = int(response.headers.get('Retry-After', 60))
+            time.sleep(retry_after)
+            continue
+
+        return response
+
+    raise Exception("Max retries exceeded")
+​
+Header summary
+Header	Direction	Required	Description
+Authorization	Request	Yes*	Bearer token authentication
+X-Request-ID	Both	No	Request correlation ID
+X-Process-Time	Response	—	Server processing time
+X-RateLimit-Limit	Response	—	Rate limit ceiling
+X-RateLimit-Remaining	Response	—	Remaining requests
+X-RateLimit-Reset	Response	—	Window reset timestamp
+Retry-After	Response	—	Wait time (429 only)
+Content-Disposition	Response	—	Filename (PDF only)
+*Not required for GET /api/v1/status
+
+
+
+Reference
+Limits & Quotas
+Understanding rate limits and request quotas.
+
+The API has two types of limits:
+Rate limits — requests per minute, per endpoint
+Request quotas — total requests per billing period
+​
+Rate limits
+Rate limits prevent abuse and ensure fair usage. They use a rolling (sliding) 60-second window.
+​
+Per-endpoint limits
+Endpoint	Limit	Window
+POST /api/v1/generate	500 requests	1 minute
+POST /api/v1/preview	300 requests	1 minute
+GET /api/v1/fonts	100 requests	1 minute
+GET /api/v1/status does not require authentication and is not rate-limited per API key.
+​
+How rate limits work
+Limits are tracked per API key, per endpoint
+Each endpoint has its own independent counter
+The window is rolling (not aligned to the clock minute)
+​
+When you hit a rate limit
+The API returns 429 Too Many Requests:
+{
+  "error": "RATE_LIMIT_EXCEEDED",
+  "message": "Rate limit exceeded for /generate: 500 requests per 1 minute(s)",
+  "limit": 500,
+  "endpoint": "/generate",
+  "retry_after": 45
+}
+Response includes:
+Retry-After header with seconds to wait
+X-RateLimit-Reset header with reset timestamp
+​
+Request quotas
+Request quotas are monthly limits on billable requests.
+​
+What counts toward quota
+Only successful /generate requests count:
+Action	Counts?
+POST /generate (success)	Yes
+POST /generate (error)	No
+POST /preview	No
+GET /fonts	No
+GET /status	No
+​
+When you hit quota
+The API returns 429 with a different error code:
+{
+  "error": "REQUEST_LIMIT_EXCEEDED",
+  "message": "Request limit exceeded: 10000/10000 monthly requests used",
+  "limit": 10000,
+  "used": 10000,
+  "period": "monthly",
+  "reset_at": "2024-02-01T00:00:00Z"
+}
+​
+Checking your quota
+View your current usage in the dashboard under Usage.
+​
+Order of checks
+Limits are checked in this order:
+​
+For POST /api/v1/generate
+Authentication — Is the API key valid?
+Request quota — Are you within monthly quota?
+Rate limit — Are you within per-minute limits?
+Request processing — Generate the output
+​
+For other authenticated endpoints
+Authentication
+Rate limit
+Request processing
+A 429 from rate limiting is different from quota — check the error field.
+On /generate, quota is checked before rate limiting. A quota 429 may not include Retry-After or X-RateLimit-* headers.
+​
+Best practices
+​
+Avoid rate limits
+Use /preview for testing (free, watermarked)
+Batch requests when possible
+Implement client-side request queuing
+​
+Handle 429 responses
+import time
+
+def generate_with_backoff(request_data, max_retries=3):
+    for attempt in range(max_retries):
+        response = api.generate(request_data)
+
+        if response.status_code == 429:
+            retry_after = int(response.headers.get('Retry-After', 60))
+            time.sleep(retry_after)
+            continue
+
+        return response
+
+    raise Exception("Rate limit exceeded after retries")
+​
+Monitor usage
+Check X-RateLimit-Remaining header on responses
+Monitor usage in dashboard before month end
+Set up alerts for high usage
+
+
+
+Reference
+Errors & Rate Limits
+Error formats, common error codes, and rate limit headers.
+
+​
+Error response format
+Error responses return JSON with an error code and message:
+{
+  "error": "SOME_ERROR_CODE",
+  "message": "Human readable message"
+}
+The X-Request-ID header is always included on all responses. Some error responses may also include a request_id field in the JSON body, but this is not guaranteed for every endpoint/status code. Use the header value when contacting support.
+​
+Error code reference
+​
+401 - Authentication errors
+Invalid key format:
+{
+  "error": "INVALID_KEY_FORMAT",
+  "message": "Invalid API key format"
+}
+Invalid or inactive key:
+{
+  "error": "INVALID_API_KEY",
+  "message": "Invalid or inactive API key"
+}
+​
+422 - Validation errors
+Validation errors include a details array with field-level issues:
+{
+  "error": "VALIDATION_ERROR",
+  "message": "Invalid request parameters",
+  "details": [
+    {
+      "field": "font_id",
+      "message": "ensure this value is less than or equal to 90",
+      "type": "value_error.number.not_le"
+    }
+  ]
+}
+​
+429 - Rate limit exceeded
+Per-endpoint rate limit:
+{
+  "error": "RATE_LIMIT_EXCEEDED",
+  "message": "Rate limit exceeded for /generate: 500 requests per 1 minute(s)",
+  "limit": 500,
+  "endpoint": "/generate",
+  "retry_after": 45
+}
+Monthly request quota exceeded (generate only):
+{
+  "error": "REQUEST_LIMIT_EXCEEDED",
+  "message": "Request limit exceeded: 10000/10000 monthly requests used",
+  "limit": 10000,
+  "used": 10000,
+  "period": "monthly",
+  "reset_at": "2024-02-01T00:00:00Z"
+}
+​
+500 - Server errors
+Server errors include request_id for support:
+{
+  "error": "GENERATION_ERROR",
+  "message": "Failed to generate image. Please try again later.",
+  "request_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+​
+Rate limit headers
+When rate limiting applies, responses include:
+Header	Description
+X-RateLimit-Limit	Maximum requests allowed in the window
+X-RateLimit-Remaining	Requests remaining in current window
+X-RateLimit-Reset	Unix timestamp when the window resets
+Retry-After	Seconds to wait before retrying (on 429 only)
+​
+Per-endpoint rate limits
+Rate limits are enforced per API key:
+Endpoint	Limit
+POST /api/v1/generate	500 requests / minute
+POST /api/v1/preview	300 requests / minute
+GET /api/v1/fonts	100 requests / minute
+GET /api/v1/status does not require authentication and is not subject to per-key rate limiting.
+​
+Request quotas (billing limits)
+Accounts may have monthly request quotas. These are enforced on /generate only and return 429 with REQUEST_LIMIT_EXCEEDED.
+​
+Request IDs
+Every response includes the X-Request-ID header. You can supply your own X-Request-ID header on requests — the API will echo it back. This is useful for correlating requests in your logs with support inquiries.
+
+
+
+Reference
+Troubleshooting
+Common issues and how to fix them.
+
+​
+Authentication errors (401)
+​
+“Invalid API key format”
+{"error": "INVALID_KEY_FORMAT", "message": "Invalid API key format"}
+Cause: API key doesn’t start with htext_.
+Fix: Ensure your Authorization header is:
+Authorization: Bearer htext_your_actual_key
+​
+“Invalid or inactive API key”
+{"error": "INVALID_API_KEY", "message": "Invalid or inactive API key"}
+Causes:
+Key was deleted or deactivated
+Key was copied incorrectly
+Using a key from wrong environment
+Fix:
+Check the key in your dashboard
+Regenerate if needed
+Ensure no extra whitespace
+​
+Validation errors (422)
+​
+“Invalid request parameters”
+{
+  "error": "VALIDATION_ERROR",
+  "message": "Invalid request parameters",
+  "details": [{"field": "font_id", "message": "...", "type": "..."}]
+}
+Check the details array for specific field errors.
+​
+Common validation issues
+Field	Error	Fix
+text	empty after cleaning	Provide non-empty text
+font_id	not in range 1-90	Use valid font ID
+font_size	not 12-400 or “auto”	Use valid size
+page_size	unknown value	Use supported format
+​
+Rate limits (429)
+​
+“Rate limit exceeded”
+{
+  "error": "RATE_LIMIT_EXCEEDED",
+  "message": "Rate limit exceeded for /generate: 500 requests per 1 minute(s)",
+  "retry_after": 45
+}
+Fix:
+Read Retry-After header
+Wait that many seconds
+Retry the request
+​
+”Request limit exceeded”
+{
+  "error": "REQUEST_LIMIT_EXCEEDED",
+  "message": "Request limit exceeded: 10000/10000 monthly requests used"
+}
+Fix: Contact sales to increase your quota, or wait for the monthly reset.
+​
+Output issues
+​
+Text is clipped/cut off
+Causes:
+Content too long for page size
+Margins too large
+Font size too large for content
+Some fonts and “natural” effects (rotation/variation/indentation) can shift strokes closer to the edge than expected
+Fixes:
+Use font_size: "auto" for automatic fitting
+Reduce margins
+Use a larger page size
+Split text across multiple requests
+If you use random effects, reduce ranges or disable them for strict layouts
+​
+Layout looks inconsistent (font/effects)
+Some fonts have different glyph metrics (letter widths, ascenders/descenders, kerning) and some effects are intentionally random. This can make certain font/settings combinations look slightly different between requests, and in edge cases can push text closer to the margins.
+Recommendations:
+Start with font_id: 1 or 2 for the most predictable output
+Use /preview with representative text and run multiple previews when randomness is enabled
+For strict print layouts, disable random effects and keep a larger margin “safe area”
+​
+Whitespace looks wrong
+The API normalizes whitespace:
+Multiple spaces → single space
+Leading/trailing whitespace → removed
+Line breaks preserved (\n)
+If you need exact spacing:
+Use explicit line breaks (\n)
+Adjust word_spacing parameter
+​
+Auto font size is too large
+For short text, auto-fit may produce very large fonts.
+Fix: Set max_auto_font_size:
+{
+  "font_size": "auto",
+  "max_auto_font_size": 80
+}
+​
+Characters missing or show as boxes
+Cause: Font doesn’t support those characters.
+Fix:
+Check font’s supported_languages via /fonts
+Switch to a font that supports your language
+Font 1 and 10 have broad language coverage
+​
+Address mode issues
+​
+”Auto font sizing is not supported for address generation”
+Address mode requires manual font sizing.
+Fix:
+{
+  "generation_type": "address",
+  "font_size": 48
+}
+​
+“Address generation supports maximum 5 lines”
+Fix: Reduce to 5 lines or fewer (count \n separators).
+​
+”Address generation supports maximum 250 characters”
+Fix: Shorten the address text.
+​
+PDF issues
+​
+PDF looks different from PNG
+Expected: PDF has white background (no transparency).
+PDFs are rendered on opaque white background for print compatibility.
+​
+PDF rejected by print service
+Fixes:
+Use appropriate preset (lob, click2mail)
+For strict preflight, use standard: "pdfx1a"
+Check bleed/crop settings match vendor requirements
+​
+PDF has crop marks I don’t want
+Fix: Use profile: "document" or a preset that disables marks:
+{
+  "pdf": {
+    "profile": "document"
+  }
+}
+Or use click2mail preset which disables marks.
+​
+Performance issues
+​
+Requests are slow
+Normal processing time is 200-800ms. If slower:
+Check your network latency
+Large text takes longer
+High DPI (600) takes longer
+Complex effects add time
+​
+Getting inconsistent results
+Natural effects are random by design:
+enable_word_rotation varies angles
+enable_natural_variation varies letter positions
+enable_random_indentation varies line starts
+For consistent output, disable these effects.
+​
+Getting help
+If these don’t resolve your issue:
+Capture the X-Request-ID from the response header
+Note the exact error message and status code
+Save your request payload (sanitize any PII)
+Contact support at api@handtextai.com
+Include all of the above for fastest resolution.
+
+
+
+Reference
+Support & Legal
+Where to get help and find the current terms.
+
+​
+Getting help
+Contact support at api@handtextai.com with:
+Your X-Request-ID header value (from the response)
+The endpoint you called
+A description of the issue
+Any error messages received
+The X-Request-ID header is included on every response. If you didn’t provide one, the API generates it automatically. Save this value for debugging.
+​
+Legal documents
+Document	URL
+Terms of Service	https://api.handtextai.com/legal/terms
+Privacy Policy	https://api.handtextai.com/legal/privacy
