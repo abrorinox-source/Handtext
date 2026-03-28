@@ -43,6 +43,7 @@ DEFAULT_SETTINGS = {
     'margin_top': 240,
     'margin_bottom': 240,
     'line_height_multiplier': 2.0,
+    'line_spacing_adjust_px': 0.0,
     'line_break_spacing': 80,
     'enable_word_rotation': False,
     'word_rotation_range': 5.0,
@@ -93,19 +94,39 @@ SCHOOL_GRAPH_FONT_LINE_MAP = {
     56: 63,
     64: 63,
     72: 62.5,
-    80: 62
+    80: 62,
+    88: 62.6,
+    96: 62.86,
+    104: 62.9,
+    112: 64.5
 }
 
 ONA_TILI_FONT_LINE_MAP = {
     56: 73,
     64: 73,
     72: 72.5,
-    80: 72
+    80: 73,
+    88: 72.6,
+    96: 72.86,
+    104: 72.9,
+    112: 73
+}
+
+ONA_TILI_TOP_MARGIN_BY_SIZE = {
+    80: -10,
+    88: -10,
+    96: -15,
+    104: -20,
+    112: -30
 }
 
 SCHOOL_GRAPH_TOP_MARGIN_BY_SIZE = {
     72: -10,
-    80: -10
+    80: -10,
+    88: -20,
+    96: -25,
+    104: -25,
+    112: -35
 }
 
 SCHOOL_GRAPH_TOP_MARGIN_BY_FONT = {
@@ -217,10 +238,11 @@ def get_effective_line_spacing_px(settings):
     """Layout va font size uchun mos line spacing px qiymatini qaytaradi"""
     layout = settings.get('preview_layout', 'plain')
     font_size = settings.get('font_size', 56)
+    line_spacing_adjust_px = float(settings.get('line_spacing_adjust_px', 0.0))
     if layout == 'ona_tili':
-        return ONA_TILI_FONT_LINE_MAP.get(font_size, 73)
+        return ONA_TILI_FONT_LINE_MAP.get(font_size, 73) + line_spacing_adjust_px
     if layout == 'school_graph':
-        return SCHOOL_GRAPH_FONT_LINE_MAP.get(font_size, 63)
+        return SCHOOL_GRAPH_FONT_LINE_MAP.get(font_size, 63) + line_spacing_adjust_px
     return None
 
 def get_effective_paragraph_spacing(settings):
@@ -295,12 +317,15 @@ def get_effective_preview_settings(settings):
         metrics = get_school_graph_metrics('a5')
         font_id = settings.get('font_id', 1)
         font_size = settings.get('font_size', 48)
+        global_top_margin_offset = settings.get('margin_top', DEFAULT_SETTINGS.get('margin_top', 240)) - DEFAULT_SETTINGS.get('margin_top', 240)
         if layout == 'ona_tili':
             line_spacing_px = ONA_TILI_FONT_LINE_MAP.get(font_size, 63)
+            size_top_margin_offset = ONA_TILI_TOP_MARGIN_BY_SIZE.get(font_size, 0)
         else:
             line_spacing_px = SCHOOL_GRAPH_FONT_LINE_MAP.get(font_size, 63)
+            size_top_margin_offset = SCHOOL_GRAPH_TOP_MARGIN_BY_SIZE.get(font_size, 0)
         top_margin_offset = get_effective_font_top_margin_offset(settings, font_id, font_size)
-        top_margin = metrics['top_margin'] + top_margin_offset
+        top_margin = metrics['top_margin'] + global_top_margin_offset + size_top_margin_offset + top_margin_offset
         preview_settings['page_size'] = 'a5'
         preview_settings['font_size'] = font_size
         if layout == 'ona_tili':
@@ -558,8 +583,8 @@ def build_settings_keyboard(settings):
         [InlineKeyboardButton(f"Font size: {settings.get('font_size', 56)} px", callback_data="setting:fontsize")],
         [InlineKeyboardButton(f"Preview Layout: {get_preview_layout_name(settings.get('preview_layout', 'plain'))}", callback_data="setting:previewlayout")],
         [InlineKeyboardButton(f"Color: {color_name}", callback_data="setting:color")],
-        [InlineKeyboardButton(f"Top margin: {settings.get('margin_top', 240)} px", callback_data="setting:topmargin")],
-        [InlineKeyboardButton(f"Line spacing: {settings.get('line_height_multiplier', 2.0)}", callback_data="setting:linespacing")],
+        [InlineKeyboardButton(f"Top margin (Plain): {settings.get('margin_top', 240)} px", callback_data="setting:topmargin")],
+        [InlineKeyboardButton(f"Line spacing (Plain): {get_effective_line_spacing_px(settings) if is_notebook_preview_layout(settings.get('preview_layout', 'plain')) else settings.get('line_spacing_adjust_px', 0.0)} px", callback_data="setting:linespacing")],
         [InlineKeyboardButton(f"Alignment: {settings['text_alignment']}", callback_data="setting:alignment")],
         [InlineKeyboardButton("Effects", callback_data="setting:effects")],
     ])
@@ -574,10 +599,11 @@ def build_settings_text(settings):
         f"Font size: {settings.get('font_size', 56)} px\n"
         f"Preview Layout: {get_preview_layout_name(settings.get('preview_layout', 'plain'))}\n"
         f"Color: {color_name}\n"
-        f"Top margin: {settings.get('margin_top', 240)} px\n"
+        f"Top margin (Plain): {settings.get('margin_top', 240)} px\n"
         f"Text: {settings['text_alignment']}\n"
-        f"Line spacing: {settings['line_height_multiplier']}\n"
+        f"Line spacing (Plain): {get_effective_line_spacing_px(settings) if is_notebook_preview_layout(settings.get('preview_layout', 'plain')) else settings.get('line_spacing_adjust_px', 0.0)} px\n"
         f"Paragraph spacing: {get_effective_paragraph_spacing(settings)} px\n\n"
+        f"Note: Plain layout uses these values directly. Notebook layouts use tuned size/template rules.\n\n"
         "Tap a button to change a setting:"
     )
 
@@ -716,17 +742,18 @@ async def show_top_margin_settings(query, settings):
 
 async def show_line_spacing_settings(query, settings):
     """Show the global line spacing settings menu."""
-    current_line_spacing = settings.get('line_height_multiplier', 2.0)
+    current_line_spacing = settings.get('line_spacing_adjust_px', 0.0)
+    effective_line_spacing = get_effective_line_spacing_px(settings)
     keyboard = [
         [
-            InlineKeyboardButton("-0.3", callback_data="linespacing:adjust:-0.3"),
-            InlineKeyboardButton("-0.1", callback_data="linespacing:adjust:-0.1"),
-            InlineKeyboardButton("-0.05", callback_data="linespacing:adjust:-0.05")
+            InlineKeyboardButton("-3", callback_data="linespacing:adjust:-3"),
+            InlineKeyboardButton("-1", callback_data="linespacing:adjust:-1"),
+            InlineKeyboardButton("-0.5", callback_data="linespacing:adjust:-0.5")
         ],
         [
-            InlineKeyboardButton("+0.05", callback_data="linespacing:adjust:0.05"),
-            InlineKeyboardButton("+0.1", callback_data="linespacing:adjust:0.1"),
-            InlineKeyboardButton("+0.3", callback_data="linespacing:adjust:0.3")
+            InlineKeyboardButton("+0.5", callback_data="linespacing:adjust:0.5"),
+            InlineKeyboardButton("+1", callback_data="linespacing:adjust:1"),
+            InlineKeyboardButton("+3", callback_data="linespacing:adjust:3")
         ],
         [
             InlineKeyboardButton("Reset", callback_data="linespacing:reset"),
@@ -735,9 +762,10 @@ async def show_line_spacing_settings(query, settings):
     ]
     await query.edit_message_text(
         f"Line spacing\n\n"
-        f"Current line spacing: {current_line_spacing}\n\n"
+        f"Current adjustment: {current_line_spacing:+g}px\n"
+        f"Effective line spacing: {effective_line_spacing if effective_line_spacing is not None else current_line_spacing:g}px\n\n"
         f"Smaller values tighten the lines. Larger values add more space.\n"
-        f"This controls the global line_height_multiplier setting.",
+        f"This control uses pixels.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -1485,17 +1513,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("linespacing:"):
         settings = get_user_settings(context, user_id)
         action = data.replace("linespacing:", "")
-        default_line_spacing = DEFAULT_SETTINGS.get('line_height_multiplier', 2.0)
+        default_line_spacing_adjust = DEFAULT_SETTINGS.get('line_spacing_adjust_px', 0.0)
 
         if action == "reset":
-            settings['line_height_multiplier'] = default_line_spacing
+            settings['line_spacing_adjust_px'] = default_line_spacing_adjust
             await query.answer("Line spacing reset")
         elif action.startswith("adjust:"):
             delta = float(action.split(":")[1])
-            current_value = float(settings.get('line_height_multiplier', default_line_spacing))
-            new_value = round(max(0.1, current_value + delta), 2)
-            settings['line_height_multiplier'] = new_value
-            await query.answer(f"Line spacing: {new_value}")
+            current_value = float(settings.get('line_spacing_adjust_px', default_line_spacing_adjust))
+            new_value = round(current_value + delta, 2)
+            settings['line_spacing_adjust_px'] = new_value
+            effective_line_spacing = get_effective_line_spacing_px(settings)
+            if effective_line_spacing is not None:
+                settings['line_height_multiplier'] = round(effective_line_spacing / settings.get('font_size', 56), 2)
+                await query.answer(f"Line spacing: {effective_line_spacing:g}px")
+            else:
+                await query.answer(f"Line spacing adjustment: {new_value:+g}px")
 
         await show_line_spacing_settings(query, settings)
         return
@@ -1977,6 +2010,14 @@ def start_healthcheck_server():
     logger.info(f"Health check server started on port {port}")
     return server
 
+
+def get_env_bool(name, default=False):
+    """Parse a boolean environment variable."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 def main():
     """Botni ishga tushirish"""
     # Bot tokenini olish
@@ -1987,8 +2028,6 @@ def main():
         print("Please set TELEGRAM_BOT_TOKEN in the .env file or as an environment variable.")
         return
     
-    start_healthcheck_server()
-
     # Application yaratish
     application = Application.builder().token(TOKEN).build()
     
@@ -2006,9 +2045,37 @@ def main():
     application.add_handler(CallbackQueryHandler(button_callback))  # Tugma bosilganda
     application.add_error_handler(error_handler)
     
-    # Botni ishga tushirish
-    logger.info("Bot ishga tushdi!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    use_webhook = get_env_bool("USE_WEBHOOK", False)
+
+    if use_webhook:
+        webhook_base_url = os.getenv("WEBHOOK_BASE_URL", "").strip().rstrip("/")
+        webhook_path = os.getenv("WEBHOOK_PATH", "webhook").strip().strip("/")
+        webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip() or None
+        port = int(os.getenv("PORT", "10000"))
+
+        if not webhook_base_url:
+            logger.error("WEBHOOK_BASE_URL is required when USE_WEBHOOK=true")
+            print("Please set WEBHOOK_BASE_URL when USE_WEBHOOK=true.")
+            return
+
+        webhook_url = f"{webhook_base_url}/{webhook_path}"
+        logger.info(f"Bot starting in webhook mode on port {port} with URL {webhook_url}")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=webhook_path,
+            webhook_url=webhook_url,
+            secret_token=webhook_secret,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=False,
+        )
+    else:
+        start_healthcheck_server()
+        logger.info("Bot starting in polling mode")
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=False
+        )
 
 if __name__ == '__main__':
     main()
