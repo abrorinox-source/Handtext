@@ -23,6 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 PREVIEW_CACHE_TTL_SECONDS = 180
+AVAILABLE_FONT_SIZES = (56, 64, 72, 80, 88, 96, 104, 112)
 
 # Default settings
 DEFAULT_SETTINGS = {
@@ -557,6 +558,7 @@ def build_settings_keyboard(settings):
         [InlineKeyboardButton(f"Font size: {settings.get('font_size', 56)} px", callback_data="setting:fontsize")],
         [InlineKeyboardButton(f"Preview Layout: {get_preview_layout_name(settings.get('preview_layout', 'plain'))}", callback_data="setting:previewlayout")],
         [InlineKeyboardButton(f"Color: {color_name}", callback_data="setting:color")],
+        [InlineKeyboardButton(f"Top margin: {settings.get('margin_top', 240)} px", callback_data="setting:topmargin")],
         [InlineKeyboardButton(f"Alignment: {settings['text_alignment']}", callback_data="setting:alignment")],
         [InlineKeyboardButton("Effects", callback_data="setting:effects")],
     ])
@@ -571,6 +573,7 @@ def build_settings_text(settings):
         f"Font size: {settings.get('font_size', 56)} px\n"
         f"Preview Layout: {get_preview_layout_name(settings.get('preview_layout', 'plain'))}\n"
         f"Color: {color_name}\n"
+        f"Top margin: {settings.get('margin_top', 240)} px\n"
         f"Text: {settings['text_alignment']}\n"
         f"Line spacing: {settings['line_height_multiplier']}\n"
         f"Paragraph spacing: {get_effective_paragraph_spacing(settings)} px\n\n"
@@ -680,6 +683,33 @@ async def show_template_shift_settings(query, settings):
         f"School Graph template shift\n\n"
         f"Current offset: {current_offset:+d}px\n\n"
         f"Negative values move the lines up, positive values move them down.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_top_margin_settings(query, settings):
+    """Show the global top margin settings menu."""
+    current_top_margin = settings.get('margin_top', 240)
+    keyboard = [
+        [
+            InlineKeyboardButton("-40", callback_data="topmargin:adjust:-40"),
+            InlineKeyboardButton("-20", callback_data="topmargin:adjust:-20"),
+            InlineKeyboardButton("-10", callback_data="topmargin:adjust:-10")
+        ],
+        [
+            InlineKeyboardButton("+10", callback_data="topmargin:adjust:10"),
+            InlineKeyboardButton("+20", callback_data="topmargin:adjust:20"),
+            InlineKeyboardButton("+40", callback_data="topmargin:adjust:40")
+        ],
+        [
+            InlineKeyboardButton("Reset", callback_data="topmargin:reset"),
+            InlineKeyboardButton("Back", callback_data="setting:back")
+        ]
+    ]
+    await query.edit_message_text(
+        f"Top margin\n\n"
+        f"Current top margin: {current_top_margin}px\n\n"
+        f"Smaller values move text upward. Larger values move text downward.\n"
+        f"This controls the global margin_top setting.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -882,7 +912,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Blue ink, high quality (300 DPI preview).\n\n"
         "Commands:\n"
         "/font [number] - Choose a font (1-90)\n"
-        "/size [56|64|72|80] - Choose font size\n"
+        "/size [56|64|72|80|88|96|104|112] - Choose font size\n"
         "/set - Open settings\n"
         "/color - Choose text color\n"
         "/fonts - Preview fonts"
@@ -1019,7 +1049,7 @@ async def show_fonts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /size komandasi - shrift o'lchamini tanlash
 async def set_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Foydalanuvchi shrift o'lchamini tanlaydi"""
-    available_sizes = (56, 64, 72, 80)
+    available_sizes = AVAILABLE_FONT_SIZES
 
     if context.args and len(context.args) > 0:
         try:
@@ -1032,7 +1062,7 @@ async def set_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await update.message.reply_text(
-                    "Only these sizes are supported: 56, 64, 72, 80.\n"
+                    "Only these sizes are supported: 56, 64, 72, 80, 88, 96, 104, 112.\n"
                     "Example: /size 72"
                 )
         except ValueError:
@@ -1043,7 +1073,7 @@ async def set_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_size = get_user_settings(context, update.message.from_user.id).get('font_size', 56)
         await update.message.reply_text(
             f"Current font size: {current_size}px\n\n"
-            "Change it with: /size [56|64|72|80]\n"
+            "Change it with: /size [56|64|72|80|88|96|104|112]\n"
             "Example: /size 72"
         )
 
@@ -1155,11 +1185,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "If you want the full-quality result without a watermark, use the button below.",
             reply_markup=reply_markup
         )
-        if is_notebook_preview_layout(settings.get('preview_layout')):
-            await update.message.reply_text(
-                build_preview_shift_text(settings),
-                reply_markup=build_preview_shift_reply_markup(text_key)
-            )
         return
         await update.message.reply_document(
             document=preview_bytes,
@@ -1245,12 +1270,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("64 px", callback_data="setval:fontsize:64")],
             [InlineKeyboardButton("72 px", callback_data="setval:fontsize:72"),
              InlineKeyboardButton("80 px", callback_data="setval:fontsize:80")],
+            [InlineKeyboardButton("88 px", callback_data="setval:fontsize:88"),
+             InlineKeyboardButton("96 px", callback_data="setval:fontsize:96")],
+            [InlineKeyboardButton("104 px", callback_data="setval:fontsize:104"),
+             InlineKeyboardButton("112 px", callback_data="setval:fontsize:112")],
             [InlineKeyboardButton("Back", callback_data="setting:back")]
         ]
         await query.edit_message_text(
-            "Choose a font size:\n\nAvailable sizes: 56 px, 64 px, 72 px, 80 px.",
+            "Choose a font size:\n\nAvailable sizes: 56 px, 64 px, 72 px, 80 px, 88 px, 96 px, 104 px, 112 px.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        return
+
+    if data == "setting:topmargin":
+        settings = get_user_settings(context, user_id)
+        await show_top_margin_settings(query, settings)
         return
 
     if data == "setting:previewlayout":
@@ -1397,6 +1431,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"Template shift: {settings['preview_template_offset_y']:+d}px")
 
         await show_template_shift_settings(query, settings)
+        return
+
+    if data.startswith("topmargin:"):
+        settings = get_user_settings(context, user_id)
+        action = data.replace("topmargin:", "")
+        default_top_margin = DEFAULT_SETTINGS.get('margin_top', 240)
+
+        if action == "reset":
+            settings['margin_top'] = default_top_margin
+            await query.answer("Top margin reset")
+        elif action.startswith("adjust:"):
+            delta = int(action.split(":")[1])
+            settings['margin_top'] = max(0, settings.get('margin_top', default_top_margin) + delta)
+            await query.answer(f"Top margin: {settings['margin_top']}px")
+
+        await show_top_margin_settings(query, settings)
         return
     
     # Sozlama qiymatini o'zgartirish
