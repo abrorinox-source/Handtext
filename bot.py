@@ -559,6 +559,7 @@ def build_settings_keyboard(settings):
         [InlineKeyboardButton(f"Preview Layout: {get_preview_layout_name(settings.get('preview_layout', 'plain'))}", callback_data="setting:previewlayout")],
         [InlineKeyboardButton(f"Color: {color_name}", callback_data="setting:color")],
         [InlineKeyboardButton(f"Top margin: {settings.get('margin_top', 240)} px", callback_data="setting:topmargin")],
+        [InlineKeyboardButton(f"Line spacing: {settings.get('line_height_multiplier', 2.0)}", callback_data="setting:linespacing")],
         [InlineKeyboardButton(f"Alignment: {settings['text_alignment']}", callback_data="setting:alignment")],
         [InlineKeyboardButton("Effects", callback_data="setting:effects")],
     ])
@@ -710,6 +711,33 @@ async def show_top_margin_settings(query, settings):
         f"Current top margin: {current_top_margin}px\n\n"
         f"Smaller values move text upward. Larger values move text downward.\n"
         f"This controls the global margin_top setting.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_line_spacing_settings(query, settings):
+    """Show the global line spacing settings menu."""
+    current_line_spacing = settings.get('line_height_multiplier', 2.0)
+    keyboard = [
+        [
+            InlineKeyboardButton("-0.3", callback_data="linespacing:adjust:-0.3"),
+            InlineKeyboardButton("-0.1", callback_data="linespacing:adjust:-0.1"),
+            InlineKeyboardButton("-0.05", callback_data="linespacing:adjust:-0.05")
+        ],
+        [
+            InlineKeyboardButton("+0.05", callback_data="linespacing:adjust:0.05"),
+            InlineKeyboardButton("+0.1", callback_data="linespacing:adjust:0.1"),
+            InlineKeyboardButton("+0.3", callback_data="linespacing:adjust:0.3")
+        ],
+        [
+            InlineKeyboardButton("Reset", callback_data="linespacing:reset"),
+            InlineKeyboardButton("Back", callback_data="setting:back")
+        ]
+    ]
+    await query.edit_message_text(
+        f"Line spacing\n\n"
+        f"Current line spacing: {current_line_spacing}\n\n"
+        f"Smaller values tighten the lines. Larger values add more space.\n"
+        f"This controls the global line_height_multiplier setting.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -1287,6 +1315,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_top_margin_settings(query, settings)
         return
 
+    if data == "setting:linespacing":
+        settings = get_user_settings(context, user_id)
+        await show_line_spacing_settings(query, settings)
+        return
+
     if data == "setting:previewlayout":
         keyboard = [
             [InlineKeyboardButton("Plain", callback_data="setting:plainpagesize")],
@@ -1447,6 +1480,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"Top margin: {settings['margin_top']}px")
 
         await show_top_margin_settings(query, settings)
+        return
+
+    if data.startswith("linespacing:"):
+        settings = get_user_settings(context, user_id)
+        action = data.replace("linespacing:", "")
+        default_line_spacing = DEFAULT_SETTINGS.get('line_height_multiplier', 2.0)
+
+        if action == "reset":
+            settings['line_height_multiplier'] = default_line_spacing
+            await query.answer("Line spacing reset")
+        elif action.startswith("adjust:"):
+            delta = float(action.split(":")[1])
+            current_value = float(settings.get('line_height_multiplier', default_line_spacing))
+            new_value = round(max(0.1, current_value + delta), 2)
+            settings['line_height_multiplier'] = new_value
+            await query.answer(f"Line spacing: {new_value}")
+
+        await show_line_spacing_settings(query, settings)
         return
     
     # Sozlama qiymatini o'zgartirish
