@@ -2,6 +2,7 @@ import os
 from copy import deepcopy
 import time
 import threading
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import requests
@@ -11,6 +12,12 @@ from dotenv import load_dotenv
 from PIL import Image, ImageDraw
 from io import BytesIO
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http import HTTPStatus
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response
+from starlette.routing import Route
+import uvicorn
 
 # .env faylini yuklash
 load_dotenv()
@@ -2018,20 +2025,9 @@ def get_env_bool(name, default=False):
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
-def main():
-    """Botni ishga tushirish"""
-    # Bot tokenini olish
-    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    
-    if not TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN environment variable was not found!")
-        print("Please set TELEGRAM_BOT_TOKEN in the .env file or as an environment variable.")
-        return
-    
-    # Application yaratish
-    application = Application.builder().token(TOKEN).build()
-    
-    # Handlerlarni qo'shish
+
+def configure_handlers(application):
+    """Register bot handlers on the application instance."""
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_menu))
     application.add_handler(CommandHandler("stats", admin_stats))
@@ -2042,35 +2038,104 @@ def main():
     application.add_handler(CommandHandler("fonts", show_fonts))
     application.add_handler(CommandHandler("color", set_color))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(button_callback))  # Tugma bosilganda
+    application.add_handler(CallbackQueryHandler(button_callback))
     application.add_error_handler(error_handler)
+
+
+async def run_webhook_mode(token):
+    """Run the bot in webhook mode with a custom HTTP app that also exposes /health."""
+    webhook_base_url = os.getenv("WEBHOOK_BASE_URL", "").strip().rstrip("/")
+    webhook_path = os.getenv("WEBHOOK_PATH", "webhook").strip().strip("/") or "webhook"
+    webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip() or None
+    port = int(os.getenv("PORT", "10000"))
+
+    if not webhook_base_url:
+        logger.error("WEBHOOK_BASE_URL is required when USE_WEBHOOK=true")
+        print("Please set WEBHOOK_BASE_URL when USE_WEBHOOK=true.")
+        return
+
+    webhook_url = f"{webhook_base_url}/{webhook_path}"
+
+    application = (
+        Application.builder()
+        .token(token)
+        .updater(None)
+        .read_timeout(60)
+        .write_timeout(60)
+        .connect_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
+    configure_handlers(application)
+
+    async def health(_: Request) -> PlainTextResponse:
+        return PlainTextResponse("ok")
+
+    async def root(_: Request) -> PlainTextResponse:
+        return PlainTextResponse("ok")
+
+    async def telegram_webhook(request: Request) -> Response:
+        if webhook_secret:
+            header_secret = request.headers.get("x-telegram-bot-api-secret-token")
+            if header_secret != webhook_secret:
+                return PlainTextResponse("forbidden", status_code=HTTPStatus.FORBIDDEN)
+
+        await application.update_queue.put(
+            Update.de_json(data=await request.json(), bot=application.bot)
+        )
+        return Response(status_code=HTTPStatus.OK)
+
+    routes = [
+        Route("/", root, methods=["GET"]),
+        Route("/health", health, methods=["GET"]),
+        Route(f"/{webhook_path}", telegram_webhook, methods=["POST"]),
+    ]
+    web_app = Starlette(routes=routes)
+
+    logger.info(f"Bot starting in webhook mode on port {port} with URL {webhook_url}")
+    await application.initialize()
+    await application.start()
+    await application.bot.set_webhook(
+        url=webhook_url,
+        allowed_updates=Update.ALL_TYPES,
+        secret_token=webhook_secret,
+    )
+
+    config = uvicorn.Config(web_app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+
+    try:
+        await server.serve()
+    finally:
+        await application.bot.delete_webhook()
+        await application.stop()
+        await application.shutdown()
+
+def main():
+    """Botni ishga tushirish"""
+    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
     
+    if not TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN environment variable was not found!")
+        print("Please set TELEGRAM_BOT_TOKEN in the .env file or as an environment variable.")
+        return
+
     use_webhook = get_env_bool("USE_WEBHOOK", False)
 
     if use_webhook:
-        webhook_base_url = os.getenv("WEBHOOK_BASE_URL", "").strip().rstrip("/")
-        webhook_path = os.getenv("WEBHOOK_PATH", "webhook").strip().strip("/")
-        webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip() or None
-        port = int(os.getenv("PORT", "10000"))
-
-        if not webhook_base_url:
-            logger.error("WEBHOOK_BASE_URL is required when USE_WEBHOOK=true")
-            print("Please set WEBHOOK_BASE_URL when USE_WEBHOOK=true.")
-            return
-
-        webhook_url = f"{webhook_base_url}/{webhook_path}"
-        logger.info(f"Bot starting in webhook mode on port {port} with URL {webhook_url}")
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=webhook_path,
-            webhook_url=webhook_url,
-            secret_token=webhook_secret,
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=False,
-        )
+        asyncio.run(run_webhook_mode(TOKEN))
     else:
         start_healthcheck_server()
+        application = (
+            Application.builder()
+            .token(TOKEN)
+            .read_timeout(60)
+            .write_timeout(60)
+            .connect_timeout(30)
+            .pool_timeout(30)
+            .build()
+        )
+        configure_handlers(application)
         logger.info("Bot starting in polling mode")
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
