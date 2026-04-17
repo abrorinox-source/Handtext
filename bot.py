@@ -3,7 +3,17 @@ from copy import deepcopy
 import time
 import threading
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import re
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
+)
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import requests
 import base64
@@ -19,6 +29,11 @@ from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
 import uvicorn
 
+try:
+    from google.cloud import firestore
+except Exception:  # pragma: no cover - runtime optional dependency
+    firestore = None
+
 # .env faylini yuklash
 load_dotenv()
 
@@ -29,8 +44,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_firestore_client = None
+_firestore_init_attempted = False
+
 PREVIEW_CACHE_TTL_SECONDS = 180
 AVAILABLE_FONT_SIZES = (56, 64, 72, 80, 88, 96, 104, 112)
+DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
+DEFAULT_GEMINI_CONNECT_TIMEOUT_SECONDS = 20
+DEFAULT_GEMINI_READ_TIMEOUT_SECONDS = 180
+DEFAULT_GEMINI_MAX_RETRIES = 1
 
 # Default settings
 DEFAULT_SETTINGS = {
@@ -61,6 +83,11 @@ DEFAULT_SETTINGS = {
     'ink_flow_intensity': 1.0
 }
 
+CYRILLIC_SUPPORTED_FONT_IDS = {
+    1, 10, 11, 18, 19, 21, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 83, 84, 85, 87, 88, 89, 90
+}
+CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
+
 PAGE_SIZE_NAMES = {
     'a4': 'A4',
     'a5': 'A5',
@@ -80,9 +107,13 @@ COLOR_NAMES = {
 }
 
 PREVIEW_LAYOUT_NAMES = {
-    'plain': 'Plain',
+    'plain': 'A4',
     'school_graph': 'Math Notebook',
-    'ona_tili': 'Language Notebook'
+    'school_graph_right': 'Math Notebook Right',
+    'school_graph_nored': 'Math Notebook No Red',
+    'ona_tili': 'Language Notebook',
+    'ona_tili_right': 'Language Notebook Right',
+    'ona_tili_nored': 'Language Notebook No Red'
 }
 
 PREVIEW_PAGE_WIDTH = 1200
@@ -136,6 +167,28 @@ SCHOOL_GRAPH_TOP_MARGIN_BY_SIZE = {
     112: -35
 }
 
+SCHOOL_GRAPH_RIGHT_PARAGRAPH_SPACING_BY_SIZE = {
+    56: 62,
+    64: 62,
+    72: 61,
+    80: 61,
+    88: 62,
+    96: 62,
+    104: 62,
+    112: 64
+}
+
+ONA_TILI_RIGHT_PARAGRAPH_SPACING_BY_SIZE = {
+    56: 72,
+    64: 72,
+    72: 71,
+    80: 72,
+    88: 71,
+    96: 71,
+    104: 71,
+    112: 72
+}
+
 SCHOOL_GRAPH_TOP_MARGIN_BY_FONT = {
     2: -15,
     3: -14,
@@ -185,6 +238,452 @@ def is_admin(user_id):
     """Foydalanuvchi admin ekanini tekshiradi"""
     return user_id in get_admin_user_ids()
 
+def _get_firestore_client():
+    """Firestore clientni lazy init qiladi. Yo'q bo'lsa None qaytaradi."""
+    global _firestore_client, _firestore_init_attempted
+
+    if _firestore_client is not None:
+        return _firestore_client
+    if _firestore_init_attempted:
+        return None
+
+    _firestore_init_attempted = True
+    if firestore is None:
+        logger.warning("google-cloud-firestore package is not installed; Firestore disabled")
+        return None
+
+    if os.getenv("FIRESTORE_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
+        logger.info("FIRESTORE_ENABLED=false, Firestore disabled")
+        return None
+
+    try:
+        project_id = os.getenv("FIRESTORE_PROJECT_ID")
+        _firestore_client = firestore.Client(project=project_id) if project_id else firestore.Client()
+        logger.info("Firestore client initialized")
+        return _firestore_client
+    except Exception as exc:
+        logger.error(f"Failed to initialize Firestore client: {exc}")
+        return None
+
+def sync_user_profile_to_firestore(user):
+    """User profilini Firestore users kolleksiyasiga yozadi."""
+    db = _get_firestore_client()
+    if db is None or user is None:
+        return
+    try:
+        user_ref = db.collection("users").document(str(user.id))
+        user_ref.set(
+            {
+                "user_id": user.id,
+                "username": user.username,
+                "full_name": user.full_name,
+                "last_seen_at": firestore.SERVER_TIMESTAMP,
+                "last_seen_date": time.strftime("%Y-%m-%d"),
+            },
+            merge=True,
+        )
+    except Exception as exc:
+        logger.error(f"Failed to sync user profile to Firestore: {exc}")
+
+def get_user_balance_credits(user_id):
+    """User balansini Firestore'dan o'qiydi. Topilmasa 0."""
+    db = _get_firestore_client()
+    if db is None:
+        return 0
+    try:
+        doc = db.collection("users").document(str(user_id)).get()
+        if not doc.exists:
+            return 0
+        data = doc.to_dict() or {}
+        return int(data.get("balance_credits", 0))
+    except Exception as exc:
+        logger.error(f"Failed to read user balance from Firestore: {exc}")
+        return 0
+
+def add_user_credits(user_id, delta, actor_user_id=None, reason="manual"):
+    """User balansiga credit qo'shadi/yeydi va payments log yozadi."""
+    db = _get_firestore_client()
+    if db is None:
+        raise RuntimeError("Firestore is not available")
+    if delta == 0:
+        return get_user_balance_credits(user_id)
+
+    user_ref = db.collection("users").document(str(user_id))
+    payment_ref = db.collection("payments").document()
+
+    try:
+        user_ref.set({"user_id": int(user_id)}, merge=True)
+        user_ref.update(
+            {
+                "balance_credits": firestore.Increment(int(delta)),
+                "last_balance_update_at": firestore.SERVER_TIMESTAMP,
+            }
+        )
+        payment_ref.set(
+            {
+                "payment_id": payment_ref.id,
+                "user_id": int(user_id),
+                "credits_delta": int(delta),
+                "reason": reason,
+                "status": "applied",
+                "actor_user_id": int(actor_user_id) if actor_user_id else None,
+                "created_at": firestore.SERVER_TIMESTAMP,
+            }
+        )
+    except Exception as exc:
+        logger.error(f"Failed to update credits in Firestore: {exc}")
+        raise
+
+    return get_user_balance_credits(user_id)
+
+def log_usage_event(user_id, action, payload=None):
+    """Usage eventni Firestore usage kolleksiyasiga yozadi."""
+    db = _get_firestore_client()
+    if db is None:
+        return
+    try:
+        usage_ref = db.collection("usage").document()
+        usage_ref.set(
+            {
+                "usage_id": usage_ref.id,
+                "user_id": int(user_id),
+                "action": action,
+                "payload": payload or {},
+                "created_at": firestore.SERVER_TIMESTAMP,
+            }
+        )
+    except Exception as exc:
+        logger.error(f"Failed to log usage event: {exc}")
+
+def build_main_menu_keyboard():
+    """Asosiy foydalanuvchi keyboardi."""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Balance"), KeyboardButton("Buy credits")],
+            [KeyboardButton("Settings")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+def build_buy_packages_keyboard():
+    """Credit paketlari uchun inline keyboard."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("50 credits - 15,000 UZS", callback_data="buypkg:50:15000")],
+            [InlineKeyboardButton("100 credits - 25,000 UZS", callback_data="buypkg:100:25000")],
+            [InlineKeyboardButton("250 credits - 55,000 UZS", callback_data="buypkg:250:55000")],
+        ]
+    )
+
+def contains_cyrillic_text(text):
+    """Matnda kirill harflari bor-yo'qligini tekshiradi."""
+    return bool(CYRILLIC_RE.search(text or ""))
+
+def get_gemini_image_api_key():
+    """Gemini image API key ni qaytaradi."""
+    return (
+        os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or os.getenv("GEMINI_KEY")
+    )
+
+def get_gemini_image_model():
+    """Gemini image model nomini qaytaradi."""
+    return os.getenv("GEMINI_IMAGE_MODEL", DEFAULT_GEMINI_IMAGE_MODEL).strip() or DEFAULT_GEMINI_IMAGE_MODEL
+
+def get_gemini_image_timeouts():
+    """Gemini API timeoutlarini qaytaradi."""
+    connect_timeout = int(os.getenv("GEMINI_CONNECT_TIMEOUT", str(DEFAULT_GEMINI_CONNECT_TIMEOUT_SECONDS)))
+    read_timeout = int(os.getenv("GEMINI_READ_TIMEOUT", str(DEFAULT_GEMINI_READ_TIMEOUT_SECONDS)))
+    return max(5, connect_timeout), max(30, read_timeout)
+
+def get_gemini_image_max_retries():
+    """Gemini API maksimal retry sonini qaytaradi."""
+    return 1
+
+def extract_gemini_image_bytes_from_response(response_json):
+    """Gemini response ichidan birinchi image bytes ni ajratadi."""
+    candidates = response_json.get("candidates", [])
+    for candidate in candidates:
+        content = candidate.get("content", {})
+        parts = content.get("parts", [])
+        for part in parts:
+            inline_data = part.get("inlineData") or part.get("inline_data")
+            if not inline_data:
+                continue
+            data_b64 = inline_data.get("data")
+            if not data_b64:
+                continue
+            mime_type = inline_data.get("mimeType") or inline_data.get("mime_type") or "image/png"
+            try:
+                return base64.b64decode(data_b64), mime_type
+            except Exception:
+                continue
+    return None, None
+
+def build_ai_editor_help_text():
+    return (
+        "AI editor ishlatish:\n\n"
+        "1. Avval rasm yuboring (photo yoki image file)\n"
+        "2. Keyin /aiedit <prompt> yuboring\n\n"
+        "Misol:\n"
+        "/aiedit Make this look like a realistic phone photo on a wooden table.\n\n"
+        "Yoki rasmga reply qilib ham yuborishingiz mumkin:\n"
+        "/aiedit Add paper texture and soft natural shadows."
+    )
+
+def get_default_ai_realistic_prompt(layout="plain"):
+    """Layoutga mos default realistic edit prompt."""
+    common_rules = (
+        "Render as a realistic smartphone photo taken from above with the page placed on a desk/table surface. "
+        "Ensure the desk surface is visible around the paper by about 1 cm on all four sides. "
+        "Focus on realistic paper relief, paper texture, soft natural shadows, and believable desk material details. "
+        "Do not add logos, watermarks, or extra objects."
+    )
+
+    if layout == "plain":
+        return (
+            "Convert this into a realistic photo of a clean A4 white paper page. "
+            "Use plain white paper only (no notebook lines, no grid, no red margins). "
+            f"{common_rules}"
+        )
+
+    if layout in ("school_graph", "school_graph_right", "school_graph_nored"):
+        redline_rule = "Keep the single red vertical margin line on the left side." if layout == "school_graph" else (
+            "Keep the single red vertical margin line on the right side." if layout == "school_graph_right" else
+            "Do not include any red vertical margin line."
+        )
+        return (
+            "Convert this into a realistic math notebook page photo. "
+            "Keep the square blue grid notebook pattern visible and natural. "
+            f"{redline_rule} "
+            f"{common_rules}"
+        )
+
+    if layout in ("ona_tili", "ona_tili_right", "ona_tili_nored"):
+        redline_rule = "Keep the red vertical margin line on the left side." if layout == "ona_tili" else (
+            "Keep the red vertical margin line on the right side." if layout == "ona_tili_right" else
+            "Do not include any red vertical margin line."
+        )
+        return (
+            "Convert this into a realistic language notebook page photo. "
+            "Keep the language notebook ruling pattern and spacing natural. "
+            f"{redline_rule} "
+            f"{common_rules}"
+        )
+
+    return (
+        "Convert this into a realistic smartphone photo of a real handwritten page. "
+        f"{common_rules}"
+    )
+
+async def extract_image_reference_from_message(message):
+    """Telegram message ichidan image reference qaytaradi."""
+    if message.photo:
+        largest_photo = message.photo[-1]
+        return {
+            "file_id": largest_photo.file_id,
+            "mime_type": "image/jpeg",
+            "source_type": "photo",
+        }
+
+    if message.document and (message.document.mime_type or "").startswith("image/"):
+        return {
+            "file_id": message.document.file_id,
+            "mime_type": message.document.mime_type or "image/png",
+            "source_type": "document",
+        }
+
+    return None
+
+async def download_telegram_file_bytes(context, file_id):
+    """Telegram file ni bytes ko'rinishida yuklaydi."""
+    tg_file = await context.bot.get_file(file_id)
+    data = await tg_file.download_as_bytearray()
+    return bytes(data)
+
+def call_gemini_image_edit(prompt, image_bytes, mime_type, api_key, model):
+    """Gemini image edit so'rovini yuboradi va image bytes qaytaradi."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": base64.b64encode(image_bytes).decode("utf-8"),
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseModalities": ["TEXT", "IMAGE"]
+        },
+    }
+
+    connect_timeout, read_timeout = get_gemini_image_timeouts()
+    max_retries = get_gemini_image_max_retries()
+    last_error = None
+    start_ts = time.time()
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.post(url, json=payload, timeout=(connect_timeout, read_timeout))
+        except requests.exceptions.Timeout:
+            last_error = Exception("AI editor so'rovi timeout bo'ldi.")
+            logger.warning(f"Gemini timeout on attempt {attempt}/{max_retries}")
+            if attempt < max_retries:
+                time.sleep(1.5 * attempt)
+                continue
+            raise last_error
+        except requests.exceptions.RequestException as exc:
+            last_error = Exception(f"AI editor network xatoligi: {exc}")
+            logger.warning(f"Gemini network error on attempt {attempt}/{max_retries}: {exc}")
+            if attempt < max_retries:
+                time.sleep(1.5 * attempt)
+                continue
+            raise last_error
+
+        if response.status_code in (429, 500, 502, 503, 504):
+            try:
+                err = response.json()
+                message = err.get("error", {}).get("message") or response.text
+            except Exception:
+                message = response.text
+            last_error = Exception(f"Gemini API vaqtinchalik xatoligi ({response.status_code}): {message}")
+            logger.warning(f"Gemini transient error on attempt {attempt}/{max_retries}: {response.status_code}")
+            if attempt < max_retries:
+                time.sleep(1.5 * attempt)
+                continue
+            raise last_error
+
+        if response.status_code != 200:
+            try:
+                err = response.json()
+                message = err.get("error", {}).get("message") or response.text
+            except Exception:
+                message = response.text
+            raise Exception(f"Gemini API xatoligi ({response.status_code}): {message}")
+
+        response_json = response.json()
+        result_bytes, result_mime = extract_gemini_image_bytes_from_response(response_json)
+        if not result_bytes:
+            raise Exception("Gemini javobida image topilmadi.")
+        elapsed = time.time() - start_ts
+        logger.info(f"Gemini image edit completed in {elapsed:.2f}s (attempt {attempt}/{max_retries})")
+        return result_bytes, result_mime or "image/png"
+
+    raise last_error or Exception("AI editor noma'lum xatolik bilan to'xtadi.")
+
+def get_telegram_photo_bytes_for_ai_result(result_bytes, result_mime):
+    """AI natijani Telegram photo uchun optimallashtiradi."""
+    mime = (result_mime or "").lower()
+    if "png" in mime:
+        try:
+            return convert_png_bytes_to_jpg_bytes(result_bytes)
+        except Exception:
+            return result_bytes
+    return result_bytes
+
+def get_cyrillic_supported_fonts_text():
+    """Kirillni support qiladigan shriftlar ro'yxatini matn ko'rinishida qaytaradi."""
+    return ", ".join(str(font_id) for font_id in sorted(CYRILLIC_SUPPORTED_FONT_IDS))
+
+def build_cyrillic_confirmation_keyboard(confirm_key):
+    """Kirill support ogohlantirishi uchun tasdiqlash tugmalari."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Ha, davom etish", callback_data=f"cyrconfirm:yes:{confirm_key}"),
+            InlineKeyboardButton("Yo'q, bekor qilish", callback_data=f"cyrconfirm:no:{confirm_key}")
+        ]
+    ])
+
+async def start_preview_flow(
+    message,
+    context,
+    user_text,
+    settings,
+    api_key,
+    text_key,
+    user_id,
+    reply_to_message_id=None
+):
+    """Notebook/oddiy preview oqimini bitta joyda bajaradi."""
+    layout = settings.get('preview_layout', 'plain')
+
+    if is_notebook_preview_layout(layout):
+        pending_key = f"{user_id}_{text_key}_{int(time.time())}"
+        if not context.bot_data.get('pending_preview_choices'):
+            context.bot_data['pending_preview_choices'] = {}
+        context.bot_data['pending_preview_choices'][pending_key] = {
+            'user_text': user_text,
+            'settings': deepcopy(settings),
+            'user_id': user_id,
+            'text_key': text_key,
+            'created_at': time.time()
+        }
+        await message.reply_text(
+            "Choose notebook side before previewing:",
+            reply_markup=build_notebook_side_choice_keyboard(pending_key)
+        )
+        return
+
+    await send_generated_preview_message(
+        message,
+        context,
+        user_text,
+        settings,
+        api_key,
+        text_key,
+        user_id,
+        reply_to_message_id=reply_to_message_id
+    )
+
+def get_bot_commands():
+    """Telegram slash commands for left-side command menu."""
+    return [
+        BotCommand("start", "Start bot and open menu"),
+        BotCommand("set", "Open settings"),
+        BotCommand("font", "Set font by id"),
+        BotCommand("size", "Set font size"),
+        BotCommand("fonts", "Show font samples"),
+        BotCommand("color", "Choose text color"),
+        BotCommand("aiedit", "Edit last/replied image with AI"),
+        BotCommand("balance", "Show credit balance"),
+        BotCommand("buy", "Open credit packages"),
+    ]
+
+async def ensure_bot_commands(application):
+    """Set Telegram slash commands at startup."""
+    try:
+        commands = get_bot_commands()
+        # Set for broad scopes and language fallbacks so clients can pick them reliably.
+        await application.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+        await application.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+        await application.bot.set_my_commands(commands, scope=BotCommandScopeDefault(), language_code="")
+        await application.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats(), language_code="")
+        logger.info("Bot commands menu configured")
+    except Exception as exc:
+        logger.error(f"Failed to set bot commands: {exc}")
+
+async def sync_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force-sync bot commands and report result."""
+    user = update.message.from_user
+    register_user_activity(context, user)
+    try:
+        commands = get_bot_commands()
+        await context.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+        await context.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+        await context.bot.set_my_commands(commands, scope=BotCommandScopeDefault(), language_code="")
+        await context.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats(), language_code="")
+        await update.message.reply_text("Commands synced. Reopen chat and check '/' menu.")
+    except Exception as exc:
+        await update.message.reply_text(f"Command sync failed: {exc}")
+
 def register_user_activity(context, user):
     """User activity statistikasi uchun foydalanuvchini qayd qiladi"""
     if user is None:
@@ -203,20 +702,13 @@ def register_user_activity(context, user):
         'last_seen_date': today
     }
     context.bot_data['activity_dates'][user_id] = today
+    sync_user_profile_to_firestore(user)
 
 def increment_stat(context, key):
     """Oddiy hisoblagichni oshiradi"""
     if not context.bot_data.get('stats'):
         context.bot_data['stats'] = {}
     context.bot_data['stats'][key] = context.bot_data['stats'].get(key, 0) + 1
-
-def is_final_render_enabled(context):
-    """Final render yoqilgan yoki o'chirilganini qaytaradi"""
-    return context.bot_data.get('final_render_enabled', False)
-
-def set_final_render_enabled(context, enabled):
-    """Final render holatini saqlaydi"""
-    context.bot_data['final_render_enabled'] = enabled
 
 def get_user_font_top_margin_override(settings, font_id):
     """User tomonidan berilgan font top margin override qiymatini qaytaradi"""
@@ -246,9 +738,10 @@ def get_effective_line_spacing_px(settings):
     layout = settings.get('preview_layout', 'plain')
     font_size = settings.get('font_size', 56)
     line_spacing_adjust_px = float(settings.get('line_spacing_adjust_px', 0.0))
-    if layout == 'ona_tili':
+    base_layout = get_notebook_layout_base(layout)
+    if base_layout == 'ona_tili':
         return ONA_TILI_FONT_LINE_MAP.get(font_size, 73) + line_spacing_adjust_px
-    if layout == 'school_graph':
+    if base_layout == 'school_graph':
         return SCHOOL_GRAPH_FONT_LINE_MAP.get(font_size, 63) + line_spacing_adjust_px
     return None
 
@@ -258,9 +751,22 @@ def get_effective_paragraph_spacing(settings):
     configured_spacing = settings.get('line_break_spacing', 80)
 
     if is_notebook_preview_layout(layout):
+        font_size = settings.get('font_size', 56)
+        base_layout = get_notebook_layout_base(layout)
+        if layout in ('school_graph_right', 'ona_tili_right'):
+            if base_layout == 'ona_tili':
+                return ONA_TILI_RIGHT_PARAGRAPH_SPACING_BY_SIZE.get(
+                    font_size,
+                    max(1, int(round(get_effective_line_spacing_px(settings) or configured_spacing)) - 1)
+                )
+            return SCHOOL_GRAPH_RIGHT_PARAGRAPH_SPACING_BY_SIZE.get(
+                font_size,
+                max(1, int(round(get_effective_line_spacing_px(settings) or configured_spacing)) - 1)
+            )
+
         line_spacing_px = get_effective_line_spacing_px(settings)
         if line_spacing_px is not None:
-            return line_spacing_px
+            return int(round(line_spacing_px))
 
     return configured_spacing
 
@@ -271,6 +777,18 @@ def get_color_name(color):
 def get_preview_layout_name(layout):
     """Preview layout nomini qaytaradi"""
     return PREVIEW_LAYOUT_NAMES.get(layout, layout)
+
+def get_notebook_layout_base(layout):
+    """Notebook layoutning asosiy turini qaytaradi."""
+    if layout in ('school_graph_right', 'school_graph', 'school_graph_nored'):
+        return 'school_graph'
+    if layout in ('ona_tili_right', 'ona_tili', 'ona_tili_nored'):
+        return 'ona_tili'
+    return layout
+
+def is_right_notebook_layout(layout):
+    """Notebook layoutning o'ng sahifa varianti ekanini tekshiradi."""
+    return layout in ('school_graph_right', 'ona_tili_right')
 
 def build_page_size_keyboard(prefix, include_back=True):
     """Page size tanlash keyboardini quradi"""
@@ -294,7 +812,10 @@ def build_page_size_keyboard(prefix, include_back=True):
 
 def is_notebook_preview_layout(layout):
     """Daftar tipidagi preview layoutlarni tekshiradi"""
-    return layout in ('school_graph', 'ona_tili')
+    return layout in (
+        'school_graph', 'school_graph_right', 'school_graph_nored',
+        'ona_tili', 'ona_tili_right', 'ona_tili_nored'
+    )
 
 def get_school_graph_metrics(page_size='a5'):
     """School graph preview uchun katak va margin o'lchamlarini hisoblaydi"""
@@ -325,7 +846,8 @@ def get_effective_preview_settings(settings):
         font_id = settings.get('font_id', 1)
         font_size = settings.get('font_size', 48)
         global_top_margin_offset = settings.get('margin_top', DEFAULT_SETTINGS.get('margin_top', 240)) - DEFAULT_SETTINGS.get('margin_top', 240)
-        if layout == 'ona_tili':
+        base_layout = get_notebook_layout_base(layout)
+        if base_layout == 'ona_tili':
             line_spacing_px = ONA_TILI_FONT_LINE_MAP.get(font_size, 63)
             size_top_margin_offset = ONA_TILI_TOP_MARGIN_BY_SIZE.get(font_size, 0)
         else:
@@ -338,28 +860,35 @@ def get_effective_preview_settings(settings):
         if layout == 'ona_tili':
             preview_settings['margin_left'] = metrics['text_margin'] + ONA_TILI_TEXT_MARGIN_OFFSET_X
             preview_settings['margin_right'] = metrics['base_step'] + ONA_TILI_RIGHT_MARGIN_OFFSET_X
+        elif layout == 'ona_tili_right':
+            preview_settings['margin_left'] = metrics['base_step'] + ONA_TILI_RIGHT_MARGIN_OFFSET_X
+            preview_settings['margin_right'] = metrics['text_margin'] + ONA_TILI_TEXT_MARGIN_OFFSET_X
+        elif layout == 'ona_tili_nored':
+            preview_settings['margin_left'] = metrics['red_margin'] + ONA_TILI_TEXT_MARGIN_OFFSET_X
+            preview_settings['margin_right'] = metrics['base_step'] + ONA_TILI_RIGHT_MARGIN_OFFSET_X
+        elif layout == 'school_graph_right':
+            preview_settings['margin_left'] = metrics['base_step']
+            preview_settings['margin_right'] = metrics['text_margin']
+        elif layout == 'school_graph_nored':
+            preview_settings['margin_left'] = metrics['red_margin']
+            preview_settings['margin_right'] = metrics['base_step']
         else:
             preview_settings['margin_left'] = metrics['text_margin']
             preview_settings['margin_right'] = metrics['base_step']
         preview_settings['margin_top'] = top_margin
         preview_settings['margin_bottom'] = max(12, round(metrics['base_step'] * 0.5))
         preview_settings['line_height_multiplier'] = round(line_spacing_px / font_size, 2)
+    else:
+        preview_settings['page_size'] = 'a4'
 
     return preview_settings
 
-def get_effective_generate_settings(settings):
-    """Final generate uchun previewga maksimal yaqin effective settingsni qaytaradi"""
-    generate_settings = settings.copy()
-
-    if is_notebook_preview_layout(settings.get('preview_layout', 'plain')):
-        generate_settings = get_effective_preview_settings(settings)
-        generate_settings['output_format'] = settings.get('output_format', 'png')
-        generate_settings['dpi'] = settings.get('dpi', 600)
-
-    return generate_settings
-
 def build_school_graph_background(size, offset_y=0):
     """Katakli maktab daftariga o'xshash fon yaratadi"""
+    return build_school_graph_background_side(size, offset_y, side='left')
+
+def build_school_graph_background_side(size, offset_y=0, side='left'):
+    """Katakli maktab daftariga o'xshash fon yaratadi."""
     width, height = size
     image = Image.new("RGBA", size, (251, 252, 248, 255))
     draw = ImageDraw.Draw(image)
@@ -380,11 +909,17 @@ def build_school_graph_background(size, offset_y=0):
     for y in range(start_y, height, base_step):
         draw.line((0, y, width, y), fill=grid_color, width=1)
 
-    draw.line((red_margin, 0, red_margin, height), fill=margin_color, width=2)
+    if side != 'none':
+        red_x = red_margin if side == 'left' else max(0, width - red_margin)
+        draw.line((red_x, 0, red_x, height), fill=margin_color, width=2)
     return image
 
 def build_ona_tili_background(size, offset_y=0):
     """Ona tili daftari uslubidagi fon yaratadi"""
+    return build_ona_tili_background_side(size, offset_y, side='left')
+
+def build_ona_tili_background_side(size, offset_y=0, side='left'):
+    """Ona tili daftari uslubidagi fon yaratadi."""
     width, height = size
     image = Image.new("RGBA", size, (250, 248, 240, 255))
     draw = ImageDraw.Draw(image)
@@ -403,11 +938,15 @@ def build_ona_tili_background(size, offset_y=0):
     for y in range(start_y, height + base_step, base_step):
         draw.line((0, y, width, y), fill=line_color, width=2)
 
-    draw.line(
-        (red_margin + ONA_TILI_RED_MARGIN_OFFSET_X, 0, red_margin + ONA_TILI_RED_MARGIN_OFFSET_X, height),
-        fill=margin_color,
-        width=2
-    )
+    if side != 'none':
+        red_x = red_margin + ONA_TILI_RED_MARGIN_OFFSET_X
+        if side == 'right':
+            red_x = max(0, width - red_margin - ONA_TILI_RED_MARGIN_OFFSET_X)
+        draw.line(
+            (red_x, 0, red_x, height),
+            fill=margin_color,
+            width=2
+        )
 
     return image
 
@@ -424,10 +963,34 @@ def apply_preview_layout(preview_bytes, settings):
             foreground.size,
             settings.get('preview_template_offset_y', 0)
         )
+    elif layout == 'school_graph_right':
+        background = build_school_graph_background_side(
+            foreground.size,
+            settings.get('preview_template_offset_y', 0),
+            side='right'
+        )
+    elif layout == 'school_graph_nored':
+        background = build_school_graph_background_side(
+            foreground.size,
+            settings.get('preview_template_offset_y', 0),
+            side='none'
+        )
     elif layout == 'ona_tili':
         background = build_ona_tili_background(
             foreground.size,
             settings.get('preview_template_offset_y', 0)
+        )
+    elif layout == 'ona_tili_right':
+        background = build_ona_tili_background_side(
+            foreground.size,
+            settings.get('preview_template_offset_y', 0),
+            side='right'
+        )
+    elif layout == 'ona_tili_nored':
+        background = build_ona_tili_background_side(
+            foreground.size,
+            settings.get('preview_template_offset_y', 0),
+            side='none'
         )
     else:
         return preview_bytes
@@ -440,7 +1003,7 @@ def apply_preview_layout(preview_bytes, settings):
 def build_preview_reply_markup(text_key, settings):
     """Preview uchun keyboardni quradi"""
     keyboard = [
-        [InlineKeyboardButton("Get Full-Quality Result", callback_data=f"fullselect:{text_key}")]
+        [InlineKeyboardButton("AI bilan realistic qilish", callback_data=f"aienhance:{text_key}")]
     ]
 
     if settings.get('preview_layout') == 'plain':
@@ -452,9 +1015,9 @@ def build_preview_reply_markup(text_key, settings):
         current_offset = settings.get('preview_template_offset_y', 0)
         keyboard.extend([
             [
-                InlineKeyboardButton("-5", callback_data=f"ps:-5:{text_key}"),
+                InlineKeyboardButton("-10", callback_data=f"ps:-10:{text_key}"),
                 InlineKeyboardButton(f"Shift {current_offset:+d}", callback_data="ps:noop"),
-                InlineKeyboardButton("+5", callback_data=f"ps:5:{text_key}")
+                InlineKeyboardButton("+10", callback_data=f"ps:10:{text_key}")
             ],
             [
                 InlineKeyboardButton("-1", callback_data=f"ps:-1:{text_key}"),
@@ -469,9 +1032,9 @@ def build_preview_shift_reply_markup(text_key):
     """Preview yuborilgandan keyingi template shift keyboardi"""
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("-5", callback_data=f"ps:-5:{text_key}"),
+            InlineKeyboardButton("-10", callback_data=f"ps:-10:{text_key}"),
             InlineKeyboardButton("Reset", callback_data=f"ps:reset:{text_key}"),
-            InlineKeyboardButton("+5", callback_data=f"ps:5:{text_key}")
+            InlineKeyboardButton("+10", callback_data=f"ps:10:{text_key}")
         ],
         [
             InlineKeyboardButton("-1", callback_data=f"ps:-1:{text_key}"),
@@ -488,40 +1051,6 @@ def build_preview_shift_text(settings):
         "Negative values move the lines up, positive values move them down."
     )
 
-def build_final_shift_reply_markup(result_key):
-    """Final output uchun template shift keyboardi"""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("-5", callback_data=f"fs:-5:{result_key}"),
-            InlineKeyboardButton("Reset", callback_data=f"fs:reset:{result_key}"),
-            InlineKeyboardButton("+5", callback_data=f"fs:5:{result_key}")
-        ],
-        [
-            InlineKeyboardButton("-1", callback_data=f"fs:-1:{result_key}"),
-            InlineKeyboardButton("Offset", callback_data="fs:noop"),
-            InlineKeyboardButton("+1", callback_data=f"fs:1:{result_key}")
-        ]
-    ])
-
-def build_final_shift_text(settings, output_format):
-    """Final output shift holatini matn ko'rinishida qaytaradi"""
-    format_label = "PDF" if output_format == "layoutpdf" else "PNG"
-    return (
-        "Final Shift\n\n"
-        f"Format: {format_label}\n"
-        f"Current offset: {settings.get('preview_template_offset_y', 0):+d}px\n"
-        "Negative values move the lines up, positive values move them down."
-    )
-
-def convert_png_bytes_to_pdf_bytes(png_bytes):
-    """PNG bytes ni PDF bytes ga o'giradi"""
-    image = Image.open(BytesIO(png_bytes)).convert("RGBA")
-    white_background = Image.new("RGB", image.size, (255, 255, 255))
-    white_background.paste(image, mask=image.getchannel("A"))
-    output = BytesIO()
-    white_background.save(output, format="PDF", resolution=300.0)
-    return output.getvalue()
-
 def convert_png_bytes_to_white_png_bytes(png_bytes):
     """Transparent PNG bytes ni oq fonli PNG bytes ga o'giradi"""
     image = Image.open(BytesIO(png_bytes)).convert("RGBA")
@@ -529,6 +1058,28 @@ def convert_png_bytes_to_white_png_bytes(png_bytes):
     white_background.paste(image, mask=image.getchannel("A"))
     output = BytesIO()
     white_background.save(output, format="PNG")
+    return output.getvalue()
+
+def remove_preview_watermark_png_bytes(png_bytes):
+    """Docsdagi qoidaga ko'ra preview watermarkini postprocessing bilan olib tashlaydi."""
+    image = Image.open(BytesIO(png_bytes)).convert("RGBA")
+    pixels = image.load()
+    width, height = image.size
+
+    for y in range(height):
+        for x in range(width):
+            r, g, b, a = pixels[x, y]
+            # Watermark odatda semi-transparent, achromatic va kulrang bo'ladi.
+            # Qo'lyozma esa rangli/kontrastli bo'lgani uchun channel spread bilan ajratamiz.
+            if a <= 5 or a >= 250:
+                continue
+            brightness = (r + g + b) / 3.0
+            channel_spread = max(r, g, b) - min(r, g, b)
+            if channel_spread < 18 and brightness > 70:
+                pixels[x, y] = (r, g, b, 0)
+
+    output = BytesIO()
+    image.save(output, format="PNG")
     return output.getvalue()
 
 def convert_png_bytes_to_jpg_bytes(png_bytes):
@@ -554,6 +1105,7 @@ def convert_png_bytes_to_jpg_bytes(png_bytes):
 def cleanup_expired_preview_cache(context):
     """Eskirgan preview cache yozuvlarini o'chiradi"""
     preview_images = context.bot_data.get('preview_images', {})
+    preview_raw_images = context.bot_data.get('preview_raw_images', {})
     preview_meta = context.bot_data.get('preview_meta', {})
     texts = context.bot_data.get('texts', {})
     text_settings = context.bot_data.get('text_settings', {})
@@ -566,20 +1118,127 @@ def cleanup_expired_preview_cache(context):
 
     for text_key in expired_keys:
         preview_images.pop(text_key, None)
+        preview_raw_images.pop(text_key, None)
         preview_meta.pop(text_key, None)
         texts.pop(text_key, None)
         text_settings.pop(text_key, None)
 
-    final_images = context.bot_data.get('final_images', {})
-    final_meta = context.bot_data.get('final_meta', {})
-    expired_final_keys = [
-        result_key for result_key, meta in final_meta.items()
+    pending_preview_choices = context.bot_data.get('pending_preview_choices', {})
+    expired_pending_keys = [
+        pending_key for pending_key, meta in pending_preview_choices.items()
         if now - meta.get('created_at', 0) > PREVIEW_CACHE_TTL_SECONDS
     ]
+    for pending_key in expired_pending_keys:
+        pending_preview_choices.pop(pending_key, None)
 
-    for result_key in expired_final_keys:
-        final_images.pop(result_key, None)
-        final_meta.pop(result_key, None)
+    pending_cyrillic_confirms = context.bot_data.get('pending_cyrillic_confirms', {})
+    expired_confirm_keys = [
+        confirm_key for confirm_key, meta in pending_cyrillic_confirms.items()
+        if now - meta.get('created_at', 0) > PREVIEW_CACHE_TTL_SECONDS
+    ]
+    for confirm_key in expired_confirm_keys:
+        pending_cyrillic_confirms.pop(confirm_key, None)
+
+def build_notebook_side_choice_keyboard(pending_key):
+    """Notebook uchun chap/o'ng tanlash keyboardi."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Left", callback_data=f"layoutchoice:left:{pending_key}"),
+            InlineKeyboardButton("No Red Line", callback_data=f"layoutchoice:none:{pending_key}"),
+            InlineKeyboardButton("Right", callback_data=f"layoutchoice:right:{pending_key}")
+        ],
+        [
+            InlineKeyboardButton("Cancel", callback_data=f"layoutchoice:cancel:{pending_key}")
+        ]
+    ])
+
+def get_side_preview_layout(base_layout, side):
+    """Notebook layoutni chap/o'ng varianti bilan qaytaradi."""
+    if base_layout == 'school_graph':
+        if side == 'none':
+            return 'school_graph_nored'
+        return 'school_graph_right' if side == 'right' else 'school_graph'
+    if base_layout == 'ona_tili':
+        if side == 'none':
+            return 'ona_tili_nored'
+        return 'ona_tili_right' if side == 'right' else 'ona_tili'
+    return base_layout
+
+async def send_generated_preview_message(message, context, user_text, settings, api_key, text_key, user_id, reply_to_message_id=None):
+    """Preview generation va yuborishni bitta oqimda bajaradi."""
+    raw_preview_bytes = text_to_handwritten_preview(user_text, api_key, settings)
+    cleaned_raw_preview_bytes = remove_preview_watermark_png_bytes(raw_preview_bytes)
+    preview_bytes = apply_preview_layout(cleaned_raw_preview_bytes, settings)
+    cleaned_preview_bytes = preview_bytes if is_notebook_preview_layout(settings.get('preview_layout')) else cleaned_raw_preview_bytes
+    preview_jpg_bytes = convert_png_bytes_to_jpg_bytes(cleaned_preview_bytes)
+    increment_stat(context, 'preview_count')
+    log_usage_event(
+        user_id,
+        "preview_generated",
+        {
+            "text_key": text_key,
+            "layout": settings.get("preview_layout", "plain"),
+            "font_id": settings.get("font_id", 1),
+            "font_size": settings.get("font_size", 56),
+        },
+    )
+
+    if not context.bot_data.get('texts'):
+        context.bot_data['texts'] = {}
+    context.bot_data['texts'][text_key] = user_text
+    if not context.bot_data.get('text_settings'):
+        context.bot_data['text_settings'] = {}
+    context.bot_data['text_settings'][text_key] = deepcopy(settings)
+    if not context.bot_data.get('preview_images'):
+        context.bot_data['preview_images'] = {}
+    context.bot_data['preview_images'][text_key] = cleaned_preview_bytes
+    if not context.bot_data.get('preview_raw_images'):
+        context.bot_data['preview_raw_images'] = {}
+    context.bot_data['preview_raw_images'][text_key] = cleaned_raw_preview_bytes
+    if not context.bot_data.get('preview_meta'):
+        context.bot_data['preview_meta'] = {}
+    context.bot_data['preview_meta'][text_key] = {
+        'created_at': time.time(),
+        'user_id': user_id
+    }
+
+    reply_markup = build_preview_reply_markup(text_key, settings)
+    photo_send_kwargs = {
+        "chat_id": message.chat.id,
+        "reply_markup": reply_markup,
+    }
+    document_send_kwargs = {
+        "chat_id": message.chat.id,
+    }
+    if reply_to_message_id is not None:
+        photo_send_kwargs["reply_to_message_id"] = reply_to_message_id
+        document_send_kwargs["reply_to_message_id"] = reply_to_message_id
+
+    await context.bot.send_photo(
+        photo=preview_jpg_bytes,
+        caption="Preview (Cleaned, 1200px)\n\n"
+                "This preview is postprocessed to remove the watermark.",
+        **photo_send_kwargs
+    )
+    preview_layout = settings.get('preview_layout')
+    preview_document_bytes = cleaned_preview_bytes
+    preview_document_caption = (
+        "Clean preview PNG\n\n"
+        "This is the postprocessed preview file without watermark."
+    )
+    if preview_layout == 'plain':
+        preview_document_bytes = convert_png_bytes_to_white_png_bytes(cleaned_preview_bytes)
+        preview_document_caption = (
+            "Clean preview PNG (white background)\n\n"
+            "This is the postprocessed preview file with white background."
+        )
+    await context.bot.send_document(
+        document=preview_document_bytes,
+        filename=f"preview_{text_key}.png",
+        caption=preview_document_caption,
+        reply_markup=reply_markup,
+        **document_send_kwargs
+    )
 
 def build_settings_keyboard(settings):
     """Asosiy settings keyboardini quradi"""
@@ -590,8 +1249,8 @@ def build_settings_keyboard(settings):
         [InlineKeyboardButton(f"Font size: {settings.get('font_size', 56)} px", callback_data="setting:fontsize")],
         [InlineKeyboardButton(f"Preview Layout: {get_preview_layout_name(settings.get('preview_layout', 'plain'))}", callback_data="setting:previewlayout")],
         [InlineKeyboardButton(f"Color: {color_name}", callback_data="setting:color")],
-        [InlineKeyboardButton(f"Top margin (Plain): {settings.get('margin_top', 240)} px", callback_data="setting:topmargin")],
-        [InlineKeyboardButton(f"Line spacing (Plain): {get_effective_line_spacing_px(settings) if is_notebook_preview_layout(settings.get('preview_layout', 'plain')) else settings.get('line_spacing_adjust_px', 0.0)} px", callback_data="setting:linespacing")],
+        [InlineKeyboardButton(f"Top margin (A4): {settings.get('margin_top', 240)} px", callback_data="setting:topmargin")],
+        [InlineKeyboardButton(f"Line spacing (A4): {get_effective_line_spacing_px(settings) if is_notebook_preview_layout(settings.get('preview_layout', 'plain')) else settings.get('line_spacing_adjust_px', 0.0)} px", callback_data="setting:linespacing")],
         [InlineKeyboardButton(f"Alignment: {settings['text_alignment']}", callback_data="setting:alignment")],
         [InlineKeyboardButton("Effects", callback_data="setting:effects")],
     ])
@@ -606,11 +1265,11 @@ def build_settings_text(settings):
         f"Font size: {settings.get('font_size', 56)} px\n"
         f"Preview Layout: {get_preview_layout_name(settings.get('preview_layout', 'plain'))}\n"
         f"Color: {color_name}\n"
-        f"Top margin (Plain): {settings.get('margin_top', 240)} px\n"
+        f"Top margin (A4): {settings.get('margin_top', 240)} px\n"
         f"Text: {settings['text_alignment']}\n"
-        f"Line spacing (Plain): {get_effective_line_spacing_px(settings) if is_notebook_preview_layout(settings.get('preview_layout', 'plain')) else settings.get('line_spacing_adjust_px', 0.0)} px\n"
+        f"Line spacing (A4): {get_effective_line_spacing_px(settings) if is_notebook_preview_layout(settings.get('preview_layout', 'plain')) else settings.get('line_spacing_adjust_px', 0.0)} px\n"
         f"Paragraph spacing: {get_effective_paragraph_spacing(settings)} px\n\n"
-        f"Note: Plain layout uses these values directly. Notebook layouts use tuned size/template rules.\n\n"
+        f"Note: A4 layout uses these values directly. Notebook layouts use tuned size/template rules.\n\n"
         "Tap a button to change a setting:"
     )
 
@@ -700,12 +1359,10 @@ async def show_template_shift_settings(query, settings):
     keyboard = [
         [
             InlineKeyboardButton("-10", callback_data="templateshift:adjust:-10"),
-            InlineKeyboardButton("-5", callback_data="templateshift:adjust:-5"),
             InlineKeyboardButton("-1", callback_data="templateshift:adjust:-1")
         ],
         [
             InlineKeyboardButton("+1", callback_data="templateshift:adjust:1"),
-            InlineKeyboardButton("+5", callback_data="templateshift:adjust:5"),
             InlineKeyboardButton("+10", callback_data="templateshift:adjust:10")
         ],
         [
@@ -740,10 +1397,10 @@ async def show_top_margin_settings(query, settings):
         ]
     ]
     await query.edit_message_text(
-        f"Top margin\n\n"
+        f"Top margin (A4)\n\n"
         f"Current top margin: {current_top_margin}px\n\n"
         f"Smaller values move text upward. Larger values move text downward.\n"
-        f"This controls the global margin_top setting.",
+        f"This controls the global margin_top setting for A4 layout.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -768,11 +1425,11 @@ async def show_line_spacing_settings(query, settings):
         ]
     ]
     await query.edit_message_text(
-        f"Line spacing\n\n"
+        f"Line spacing (A4)\n\n"
         f"Current adjustment: {current_line_spacing:+g}px\n"
         f"Effective line spacing: {effective_line_spacing if effective_line_spacing is not None else current_line_spacing:g}px\n\n"
         f"Smaller values tighten the lines. Larger values add more space.\n"
-        f"This control uses pixels.",
+        f"This control uses pixels for A4 layout.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -870,116 +1527,138 @@ def text_to_handwritten_preview(text: str, api_key: str, settings: dict) -> byte
         logger.error(f"API request error: {e}")
         raise Exception(f"Network error: {str(e)}")
 
-# HandText AI API orqali TO'LIQ SIFATLI image yaratish (PNG yoki PDF)
-def text_to_handwritten_image(text: str, api_key: str, settings: dict):
-    """
-    HandText AI API orqali text ni handwritten rasm ga o'zgartiradi
-    
-    Args:
-        text: Handwritten ga o'zgartirilishi kerak bo'lgan text
-        api_key: HandText AI API kaliti (htext_... format)
-        font_id: Font ID (1-90), default: 1
-    
-    Returns:
-        bytes: PNG formatidagi rasm
-    """
-    # HandText AI API endpoint (to'g'ri)
-    api_url = "https://api.handtextai.com/api/v1/generate"
-    
-    # API ga yuborilishi kerak bo'lgan ma'lumotlar
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
-    # API parametrlari (settings dan)
-    effective_settings = get_effective_generate_settings(settings)
-    output_format = effective_settings.get('output_format', 'png')
-    
-    payload = {
-        "text": text,
-        "font_id": effective_settings.get('font_id', 1),
-        "font_size": effective_settings.get('font_size', 56),
-        "page_size": effective_settings.get('page_size', 'a4'),
-        "dpi": effective_settings.get('dpi', 300),
-        "output_format": output_format,
-        "text_color": effective_settings.get('text_color', [0, 0, 255]),
-        "text_alignment": effective_settings.get('text_alignment', 'left'),
-        "margin_left": effective_settings.get('margin_left', 240),
-        "margin_right": effective_settings.get('margin_right', 240),
-        "margin_top": effective_settings.get('margin_top', 240),
-        "margin_bottom": effective_settings.get('margin_bottom', 240),
-        "line_height_multiplier": effective_settings.get('line_height_multiplier', 2.0),
-        "enable_word_rotation": effective_settings.get('enable_word_rotation', False),
-        "word_rotation_range": effective_settings.get('word_rotation_range', 5.0),
-        "enable_natural_variation": effective_settings.get('enable_natural_variation', False),
-        "natural_variation_alpha": effective_settings.get('natural_variation_alpha', 15),
-        "natural_variation_sigma": effective_settings.get('natural_variation_sigma', 5),
-        "enable_ink_flow": effective_settings.get('enable_ink_flow', False),
-        "ink_flow_intensity": effective_settings.get('ink_flow_intensity', 1.0)
-    }
-
-    if has_paragraph_breaks(text):
-        payload["line_break_spacing"] = get_effective_paragraph_spacing(effective_settings)
-    
-    try:
-        logger.info("Sending HandText AI API request...")
-        response = requests.post(api_url, json=payload, headers=headers, timeout=120)
-        
-        if response.status_code == 200:
-            # PDF yoki PNG ekanligini tekshirish
-            if output_format == 'pdf':
-                # PDF - binary response
-                pdf_bytes = response.content
-                logger.info(f"PDF created successfully. Size: {len(pdf_bytes)} bytes")
-                return {'type': 'pdf', 'data': pdf_bytes}
-            else:
-                # PNG - JSON response
-                result = response.json()
-                image_base64 = result.get('image_base64')
-                if not image_base64:
-                    raise Exception("image_base64 was not found in the response")
-                
-                image_bytes = base64.b64decode(image_base64)
-                logger.info(f"PNG created successfully. Size: {len(image_bytes)} bytes")
-                return {'type': 'png', 'data': image_bytes}
-        elif response.status_code == 401:
-            logger.error("API key is invalid")
-            raise Exception("The API key is invalid. Please check your API key.")
-        elif response.status_code == 429:
-            logger.error("API limit reached")
-            raise Exception("API limit reached. Please try again later.")
-        else:
-            logger.error(f"API returned an error: {response.status_code} - {response.text}")
-            raise Exception(f"API error: {response.status_code}")
-            
-    except requests.exceptions.Timeout:
-        logger.error("API request timed out")
-        raise Exception("The API request took too long. Please try again.")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"API request error: {e}")
-        raise Exception(f"Network error: {str(e)}")
-
 # /start komandasi
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Bot ishga tushganda yuboriladi"""
     register_user_activity(context, update.message.from_user)
+    try:
+        commands = get_bot_commands()
+        await context.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+        await context.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+        await context.bot.set_my_commands(commands, scope=BotCommandScopeDefault(), language_code="")
+        await context.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats(), language_code="")
+    except Exception as exc:
+        logger.error(f"Failed to refresh bot commands in /start: {exc}")
     await update.message.reply_text(
         "Hello!\n\n"
         "I turn text into realistic handwritten writing.\n\n"
         "How it works:\n"
         "1. Send me text\n"
-        "2. Get a free preview with a watermark\n"
-        "3. If you like it, tap the button to get the full-quality result\n\n"
+        "2. Get a free preview\n"
+        "3. Adjust layout if needed\n\n"
         "There are 90 handwritten fonts available.\n"
-        "Blue ink, high quality (300 DPI preview).\n\n"
+        "Blue ink, preview-only mode.\n\n"
         "Commands:\n"
         "/font [number] - Choose a font (1-90)\n"
         "/size [56|64|72|80|88|96|104|112] - Choose font size\n"
         "/set - Open settings\n"
         "/color - Choose text color\n"
-        "/fonts - Preview fonts"
+        "/aiedit <prompt> - Edit last image with AI\n"
+        "/fonts - Preview fonts\n"
+        "/balance - View credit balance\n"
+        "/buy - Open credit packages\n"
+        "/synccommands - Refresh slash command menu",
+        reply_markup=build_main_menu_keyboard()
     )
+
+async def ai_editor_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """AI editor bo'yicha qisqa yo'riqnoma."""
+    register_user_activity(context, update.message.from_user)
+    await update.message.reply_text(build_ai_editor_help_text())
+
+async def remember_latest_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchi yuborgan so'nggi rasmni AI editor uchun saqlab qo'yadi."""
+    register_user_activity(context, update.message.from_user)
+    image_ref = await extract_image_reference_from_message(update.message)
+    if not image_ref:
+        return
+
+    context.user_data['ai_editor_last_image_ref'] = {
+        **image_ref,
+        "saved_at": time.time(),
+    }
+    await update.message.reply_text(
+        "Rasm AI editor uchun saqlandi. Endi /aiedit <prompt> yuboring."
+    )
+
+async def ai_edit_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """So'nggi yoki reply qilingan rasmni Gemini orqali tahrirlaydi."""
+    register_user_activity(context, update.message.from_user)
+
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.message.reply_text(
+            "Prompt kiriting. Misol:\n/aiedit Make this look like a realistic phone photo on a wooden table."
+        )
+        return
+
+    image_ref = None
+    if update.message.reply_to_message:
+        image_ref = await extract_image_reference_from_message(update.message.reply_to_message)
+        if image_ref:
+            context.user_data['ai_editor_last_image_ref'] = {
+                **image_ref,
+                "saved_at": time.time(),
+            }
+
+    if not image_ref:
+        image_ref = context.user_data.get('ai_editor_last_image_ref')
+
+    if not image_ref:
+        await update.message.reply_text(
+            "Avval rasm yuboring, keyin /aiedit <prompt> ishlating."
+        )
+        return
+
+    api_key = get_gemini_image_api_key()
+    if not api_key:
+        await update.message.reply_text(
+            "GEMINI_API_KEY topilmadi. .env ga GEMINI_API_KEY qo'shing."
+        )
+        return
+
+    model = get_gemini_image_model()
+
+    try:
+        await update.message.chat.send_action("upload_photo")
+        source_bytes = await download_telegram_file_bytes(context, image_ref["file_id"])
+        result_bytes, result_mime = await asyncio.to_thread(
+            call_gemini_image_edit,
+            prompt,
+            source_bytes,
+            image_ref.get("mime_type", "image/jpeg"),
+            api_key,
+            model,
+        )
+        telegram_photo_bytes = get_telegram_photo_bytes_for_ai_result(result_bytes, result_mime)
+
+        await update.message.reply_photo(
+            photo=telegram_photo_bytes,
+            caption=f"AI edited ({model})",
+            connect_timeout=30,
+            read_timeout=120,
+            write_timeout=120,
+            pool_timeout=60,
+        )
+
+        extension = "png"
+        if result_mime.endswith("jpeg") or result_mime.endswith("jpg"):
+            extension = "jpg"
+        try:
+            await update.message.reply_document(
+                document=result_bytes,
+                filename=f"ai_edit_result.{extension}",
+                caption="AI editor file",
+                connect_timeout=30,
+                read_timeout=120,
+                write_timeout=120,
+                pool_timeout=60,
+            )
+        except Exception as doc_exc:
+            logger.warning(f"AI result document send failed: {doc_exc}")
+    except Exception as exc:
+        logger.error(f"AI editor error: {exc}")
+        await update.message.reply_text(f"AI editor xatoligi: {exc}")
 
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin buyruqlari haqida ma'lumot beradi"""
@@ -993,35 +1672,10 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Admin commands:\n\n"
         "/admin - admin menu\n"
-        "/stats - bot statistics\n\n"
-        "/final on|off|status - control final rendering\n\n"
+        "/stats - bot statistics\n"
+        "/addcredit <user_id> <amount> - update credits\n\n"
+        "Preview-only mode is active.\n\n"
         "Set ADMIN_USER_IDS in .env as a comma-separated list."
-    )
-
-async def admin_final_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin uchun final renderni yoqish/o'chirish"""
-    user = update.message.from_user
-    register_user_activity(context, user)
-
-    if not is_admin(user.id):
-        await update.message.reply_text("This command is for admins only.")
-        return
-
-    action = context.args[0].lower() if context.args else "status"
-
-    if action == "on":
-        set_final_render_enabled(context, True)
-        await update.message.reply_text("Final rendering enabled.")
-        return
-    if action == "off":
-        set_final_render_enabled(context, False)
-        await update.message.reply_text("Final rendering disabled.")
-        return
-
-    status_text = "enabled" if is_final_render_enabled(context) else "disabled"
-    await update.message.reply_text(
-        f"Final rendering is currently: {status_text}\n\n"
-        "Usage: /final on | /final off | /final status"
     )
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1044,9 +1698,68 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Total users: {len(known_users)}\n"
         f"Active today: {active_today}\n"
         f"Preview count: {stats.get('preview_count', 0)}\n"
-        f"Final generate count: {stats.get('final_generate_count', 0)}\n"
         f"Auto-fit preview count: {stats.get('auto_fit_preview_count', 0)}\n"
-        f"Final rendering: {'enabled' if is_final_render_enabled(context) else 'disabled'}"
+        "Preview-only mode is active."
+    )
+
+async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchining credit balansini ko'rsatadi."""
+    user = update.message.from_user
+    register_user_activity(context, user)
+
+    if _get_firestore_client() is None:
+        await update.message.reply_text("Balance is unavailable now. Firestore is not configured.")
+        return
+
+    balance = get_user_balance_credits(user.id)
+    await update.message.reply_text(f"Your balance: {balance} credits")
+
+async def buy_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Credit paketlari menyusini ko'rsatadi."""
+    user = update.message.from_user
+    register_user_activity(context, user)
+    await update.message.reply_text(
+        "Choose a credit package:",
+        reply_markup=build_buy_packages_keyboard()
+    )
+
+async def admin_add_credit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin uchun userga credit qo'shish."""
+    user = update.message.from_user
+    register_user_activity(context, user)
+
+    if not is_admin(user.id):
+        await update.message.reply_text("This command is for admins only.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /addcredit <user_id> <amount>")
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+        delta = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Invalid format. Usage: /addcredit <user_id> <amount>")
+        return
+
+    if _get_firestore_client() is None:
+        await update.message.reply_text("Firestore is not configured.")
+        return
+
+    try:
+        new_balance = add_user_credits(
+            target_user_id,
+            delta,
+            actor_user_id=user.id,
+            reason="admin_addcredit",
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"Failed to update credits: {exc}")
+        return
+
+    await update.message.reply_text(
+        f"Updated user {target_user_id} by {delta:+d} credits.\nNew balance: {new_balance}"
     )
 
 # /font komandasi - font tanlash
@@ -1076,7 +1789,7 @@ async def set_font(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Current font: {current_font}\n\n"
             "Change font: /font [1-90]\n"
             "Example: /font 5\n\n"
-            "Recommended: Font 1 or 2 (most stable)"
+            "Recommended: Fonts 1 to 11"
         )
 
 # /fonts komandasi - fontlarni ko'rish
@@ -1089,14 +1802,18 @@ async def show_fonts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("Font 3", callback_data="testfont:3")
         ],
         [
+            InlineKeyboardButton("Font 4", callback_data="testfont:4"),
             InlineKeyboardButton("Font 5", callback_data="testfont:5"),
-            InlineKeyboardButton("Font 10", callback_data="testfont:10"),
-            InlineKeyboardButton("Font 15", callback_data="testfont:15")
+            InlineKeyboardButton("Font 6", callback_data="testfont:6")
         ],
         [
-            InlineKeyboardButton("Font 20", callback_data="testfont:20"),
-            InlineKeyboardButton("Font 25", callback_data="testfont:25"),
-            InlineKeyboardButton("Font 30", callback_data="testfont:30")
+            InlineKeyboardButton("Font 7", callback_data="testfont:7"),
+            InlineKeyboardButton("Font 8", callback_data="testfont:8"),
+            InlineKeyboardButton("Font 9", callback_data="testfont:9")
+        ],
+        [
+            InlineKeyboardButton("Font 10", callback_data="testfont:10"),
+            InlineKeyboardButton("Font 11", callback_data="testfont:11")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1105,7 +1822,7 @@ async def show_fonts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Try the fonts!\n\n"
         "Tap a button to see a sample.\n"
         "If you like one, set it with /font [number].\n\n"
-        "Recommended: Font 1 or 2 (most stable)",
+        "Recommended: Fonts 1 to 11 (max-size sample)",
         reply_markup=reply_markup
     )
 
@@ -1184,7 +1901,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         await update.message.reply_text("Please send some text.")
         return
-    
+
+    normalized = user_text.strip().lower()
+    if normalized == "balance":
+        await show_balance(update, context)
+        return
+    if normalized == "buy credits":
+        await buy_menu(update, context)
+        return
+    if normalized == "settings":
+        await settings_menu(update, context)
+        return
     # API key ni olish
     api_key = os.getenv('HANTEXT_API_KEY')
     if not api_key:
@@ -1203,67 +1930,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Foydalanuvchining sozlamalarini olish
         user_id = update.message.from_user.id
         settings = get_user_settings(context, user_id)
-        
-        # AVVAL: Preview yaratish
-        raw_preview_bytes = text_to_handwritten_preview(user_text, api_key, settings)
-        preview_bytes = apply_preview_layout(raw_preview_bytes, settings)
-        preview_jpg_bytes = convert_png_bytes_to_jpg_bytes(preview_bytes)
-        increment_stat(context, 'preview_count')
-        
-        # User text ni context ga saqlash (callback uchun)
-        # Telegram callback_data maksimum 64 bytes, shuning uchun butun textni saqlamaymiz
-        user_id = update.message.from_user.id
-        message_id = update.message.message_id
-        
-        # Unique key yaratish
-        text_key = f"{user_id}_{message_id}"
-        
-        if not context.bot_data.get('texts'):
-            context.bot_data['texts'] = {}
-        context.bot_data['texts'][text_key] = user_text
-        if not context.bot_data.get('text_settings'):
-            context.bot_data['text_settings'] = {}
-        context.bot_data['text_settings'][text_key] = deepcopy(settings)
-        if not context.bot_data.get('preview_images'):
-            context.bot_data['preview_images'] = {}
-        context.bot_data['preview_images'][text_key] = raw_preview_bytes
-        if not context.bot_data.get('preview_meta'):
-            context.bot_data['preview_meta'] = {}
-        context.bot_data['preview_meta'][text_key] = {
-            'created_at': time.time(),
-            'user_id': user_id
-        }
-        
-        # Build the inline keyboard for the full-quality result button.
-        keyboard = [
-            [InlineKeyboardButton("✅ To'liq Sifatli Rasm Olish", callback_data=f"full:{text_key}")]
-        ]
-        reply_markup = build_preview_reply_markup(text_key, settings)
-        
-        # Preview rasmni yuborish
-        await update.message.reply_photo(
-            photo=preview_jpg_bytes,
-            caption="Preview (Watermarked, 1200px)\n\n"
-                    "This is a free watermarked preview.\n"
-                    "If you want the full-quality result without a watermark, use the button below.",
-            reply_markup=reply_markup
+        text_key = f"{user_id}_{update.message.message_id}"
+
+        if contains_cyrillic_text(user_text) and settings.get('font_id') not in CYRILLIC_SUPPORTED_FONT_IDS:
+            confirm_key = f"{user_id}_{update.message.message_id}_{int(time.time())}"
+            if not context.bot_data.get('pending_cyrillic_confirms'):
+                context.bot_data['pending_cyrillic_confirms'] = {}
+            context.bot_data['pending_cyrillic_confirms'][confirm_key] = {
+                'user_text': user_text,
+                'settings': deepcopy(settings),
+                'user_id': user_id,
+                'text_key': text_key,
+                'created_at': time.time(),
+                'source_message_id': update.message.message_id,
+            }
+            await update.message.reply_text(
+                "Tanlangan shriftda kirill harflari qo'llab-quvvatlanmaydi.\n"
+                "Davom etasizmi?\n\n"
+                f"Kirill support shriftlari: {get_cyrillic_supported_fonts_text()}",
+                reply_markup=build_cyrillic_confirmation_keyboard(confirm_key)
+            )
+            return
+
+        await start_preview_flow(
+            update.message,
+            context,
+            user_text,
+            settings,
+            api_key,
+            text_key,
+            user_id,
+            reply_to_message_id=update.message.message_id
         )
         return
-        await update.message.reply_document(
-            document=preview_bytes,
-            filename=f"preview_{text_key}.png",
-            caption="🎨 Preview (Watermark bilan, 1200px)\n\n"
-                    "Bu watermarked preview - TEKIN! ✅\n"
-                    "Watermark yo'q, to'liq sifatli rasm olish uchun pastdagi tugmani bosing! 👇",
-            reply_markup=reply_markup
-        )
 
-        if is_notebook_preview_layout(settings.get('preview_layout')):
-            await update.message.reply_text(
-                build_preview_shift_text(settings),
-                reply_markup=build_preview_shift_reply_markup(text_key)
-            )
-        
     except Exception as e:
         logger.error(f"An error occurred: {e}")
         await update.message.reply_text(
@@ -1282,10 +1982,195 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = query.from_user.id
 
-    if data == "ps:noop":
+    if data.startswith("buypkg:"):
+        _, credits_raw, amount_raw = data.split(":", 2)
+        payment_contact = os.getenv("PAYMENT_CONTACT", "").strip()
+        payment_link = os.getenv("PAYMENT_LINK", "").strip()
+        message = (
+            f"Package selected: {credits_raw} credits\n"
+            f"Amount: {amount_raw} UZS\n\n"
+            "Send payment and then send your receipt to admin."
+        )
+        if payment_contact:
+            message += f"\nPayment contact: {payment_contact}"
+        if payment_link:
+            message += f"\nPayment link: {payment_link}"
+        message += "\nAfter payment, send your receipt to admin."
+        await query.message.reply_text(message)
         return
 
-    if data == "fs:noop":
+    if data.startswith("aienhance:"):
+        cleanup_expired_preview_cache(context)
+        text_key = data.split(":", 1)[1]
+        preview_meta = context.bot_data.get('preview_meta', {}).get(text_key)
+        if not preview_meta:
+            await query.message.reply_text("Preview eskirgan. Matnni qayta yuboring.")
+            return
+        if preview_meta.get('user_id') != user_id:
+            await query.message.reply_text("Bu preview sizga tegishli emas.")
+            return
+
+        file_id = None
+        file_mime = "image/jpeg"
+        if query.message and query.message.photo:
+            file_id = query.message.photo[-1].file_id
+            file_mime = "image/jpeg"
+        elif query.message and query.message.document and (query.message.document.mime_type or "").startswith("image/"):
+            file_id = query.message.document.file_id
+            file_mime = query.message.document.mime_type or "image/png"
+        if not file_id:
+            await query.message.reply_text("AI tugmasini preview rasm yoki PNG fayl xabari ustidan bosing.")
+            return
+
+        layout = context.bot_data.get('text_settings', {}).get(text_key, {}).get('preview_layout', 'plain')
+
+        api_key = get_gemini_image_api_key()
+        if not api_key:
+            await query.message.reply_text("GEMINI_API_KEY topilmadi.")
+            return
+
+        model = get_gemini_image_model()
+        try:
+            await query.message.chat.send_action("upload_photo")
+            source_bytes = await download_telegram_file_bytes(context, file_id)
+            result_bytes, result_mime = await asyncio.to_thread(
+                call_gemini_image_edit,
+                get_default_ai_realistic_prompt(layout),
+                source_bytes,
+                file_mime,
+                api_key,
+                model,
+            )
+            telegram_photo_bytes = get_telegram_photo_bytes_for_ai_result(result_bytes, result_mime)
+            await query.message.reply_photo(
+                photo=telegram_photo_bytes,
+                caption=f"AI realistic natija ({model})",
+                connect_timeout=30,
+                read_timeout=120,
+                write_timeout=120,
+                pool_timeout=60,
+            )
+            extension = "png"
+            if result_mime.endswith("jpeg") or result_mime.endswith("jpg"):
+                extension = "jpg"
+            try:
+                await query.message.reply_document(
+                    document=result_bytes,
+                    filename=f"ai_realistic_{text_key}.{extension}",
+                    caption="AI realistic file",
+                    connect_timeout=30,
+                    read_timeout=120,
+                    write_timeout=120,
+                    pool_timeout=60,
+                )
+            except Exception as doc_exc:
+                logger.warning(f"AI realistic document send failed: {doc_exc}")
+        except Exception as exc:
+            logger.error(f"AI realistic callback error: {exc}")
+            await query.message.reply_text(f"AI edit xatoligi: {exc}")
+        return
+
+    if data.startswith("cyrconfirm:"):
+        cleanup_expired_preview_cache(context)
+        _, decision, confirm_key = data.split(":", 2)
+        pending_cyrillic_confirms = context.bot_data.get('pending_cyrillic_confirms', {})
+        pending_item = pending_cyrillic_confirms.pop(confirm_key, None)
+
+        if not pending_item:
+            await query.message.reply_text("Tasdiqlash muddati tugagan. Matnni qayta yuboring.")
+            return
+
+        if decision == "no":
+            try:
+                await query.message.delete()
+            except Exception:
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+            await query.message.reply_text("Bekor qilindi. Yangi matn yuborishingiz mumkin.")
+            return
+
+        if decision != "yes":
+            await query.message.reply_text("Noto'g'ri amal.")
+            return
+
+        api_key = os.getenv('HANTEXT_API_KEY')
+        if not api_key:
+            await query.message.reply_text("The bot is not configured.")
+            return
+
+        try:
+            await query.message.delete()
+        except Exception:
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+        await start_preview_flow(
+            query.message,
+            context,
+            pending_item['user_text'],
+            deepcopy(pending_item['settings']),
+            api_key,
+            pending_item['text_key'],
+            pending_item['user_id'],
+            reply_to_message_id=pending_item.get('source_message_id')
+        )
+        return
+
+    if data.startswith("layoutchoice:"):
+        cleanup_expired_preview_cache(context)
+        _, side, pending_key = data.split(":", 2)
+        pending_preview_choices = context.bot_data.get('pending_preview_choices', {})
+        pending_item = pending_preview_choices.pop(pending_key, None)
+
+        if not pending_item:
+            await query.message.reply_text("Preview request expired. Please send the text again.")
+            return
+
+        if side == "cancel":
+            try:
+                await query.message.delete()
+            except Exception:
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+            await query.answer("Notebook side selection canceled.")
+            return
+
+        api_key = os.getenv('HANTEXT_API_KEY')
+        if not api_key:
+            await query.message.reply_text("The bot is not configured.")
+            return
+
+        base_settings = deepcopy(pending_item['settings'])
+        base_settings['preview_layout'] = get_side_preview_layout(base_settings.get('preview_layout', 'plain'), side)
+        text_key = pending_item['text_key']
+        user_text = pending_item['user_text']
+        try:
+            await query.message.delete()
+        except Exception:
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        await query.answer("Generating preview...")
+        await send_generated_preview_message(
+            query.message,
+            context,
+            user_text,
+            base_settings,
+            api_key,
+            text_key,
+            pending_item['user_id'],
+            reply_to_message_id=None
+        )
+        return
+
+    if data == "ps:noop":
         return
 
     if data == "af:noop":
@@ -1357,21 +2242,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "setting:previewlayout":
         keyboard = [
-            [InlineKeyboardButton("Plain", callback_data="setting:plainpagesize")],
+            [InlineKeyboardButton("A4", callback_data="setval:previewlayout:plain")],
             [InlineKeyboardButton("Math Notebook", callback_data="setval:previewlayout:school_graph")],
             [InlineKeyboardButton("Language Notebook", callback_data="setval:previewlayout:ona_tili")],
             [InlineKeyboardButton("Back", callback_data="setting:back")]
         ]
         await query.edit_message_text(
-            "Choose a preview layout:\n\nThis currently applies to preview only.",
+            "Choose a preview layout:\n\nA4 is fixed for the plain layout.\n"
+            "Right notebook variants mirror the red margin to the right side.",
             reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-
-    if data == "setting:plainpagesize":
-        await query.edit_message_text(
-            "Choose a page size for the plain layout:",
-            reply_markup=build_page_size_keyboard("setplainpage")
         )
         return
 
@@ -1558,6 +2437,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_user_setting(context, user_id, 'font_size', int(value))
         elif setting_type == "previewlayout":
             update_user_setting(context, user_id, 'preview_layout', value)
+            if value == 'plain':
+                update_user_setting(context, user_id, 'page_size', 'a4')
         elif setting_type == "color":
             update_user_setting(context, user_id, 'text_color', [int(part) for part in value.split(",")])
         elif setting_type == "margin":
@@ -1579,15 +2460,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_margin_spacing_settings(query, settings)
         else:
             await show_settings_message(query, settings)
-        return
-
-    if data.startswith("setplainpage:"):
-        page_size = data.replace("setplainpage:", "")
-        update_user_setting(context, user_id, 'preview_layout', 'plain')
-        update_user_setting(context, user_id, 'page_size', page_size)
-        await query.answer("Plain layout and page size saved!")
-        settings = get_user_settings(context, user_id)
-        await show_settings_message(query, settings)
         return
     
     # Effektlarni yoqish/o'chirish
@@ -1639,6 +2511,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             settings = get_user_settings(context, user_id)
             test_settings = settings.copy()
             test_settings['font_id'] = font_id
+            test_settings['font_size'] = max(AVAILABLE_FONT_SIZES)
             preview_bytes = text_to_handwritten_preview(test_text, api_key, test_settings)
             
             # Rasmni yuborish
@@ -1684,8 +2557,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split(":")
         action = parts[1]
         text_key = parts[2] if len(parts) > 2 else None
-        settings = get_user_settings(context, user_id)
-        raw_preview_bytes = context.bot_data.get('preview_images', {}).get(text_key)
+        settings = deepcopy(
+            context.bot_data.get('text_settings', {}).get(
+                text_key,
+                get_user_settings(context, user_id)
+            )
+        )
+        raw_preview_bytes = (
+            context.bot_data.get('preview_raw_images', {}).get(text_key)
+            or context.bot_data.get('preview_images', {}).get(text_key)
+        )
 
         if not raw_preview_bytes:
             await query.message.reply_text(
@@ -1698,7 +2579,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             settings['preview_template_offset_y'] = settings.get('preview_template_offset_y', 0) + int(action)
 
-        updated_preview = apply_preview_layout(raw_preview_bytes, settings)
+        if not context.bot_data.get('text_settings'):
+            context.bot_data['text_settings'] = {}
+        context.bot_data['text_settings'][text_key] = deepcopy(settings)
+
+        cleaned_raw_preview_bytes = remove_preview_watermark_png_bytes(raw_preview_bytes)
+        updated_preview = apply_preview_layout(cleaned_raw_preview_bytes, settings)
         updated_preview_jpg = convert_png_bytes_to_jpg_bytes(updated_preview)
 
         await query.message.reply_photo(
@@ -1737,13 +2623,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         auto_settings['preview_layout'] = 'plain'
 
         raw_preview_bytes = text_to_handwritten_preview(user_text, api_key, auto_settings)
-        preview_jpg_bytes = convert_png_bytes_to_jpg_bytes(raw_preview_bytes)
+        clean_auto_preview_bytes = remove_preview_watermark_png_bytes(raw_preview_bytes)
+        preview_jpg_bytes = convert_png_bytes_to_jpg_bytes(clean_auto_preview_bytes)
         increment_stat(context, 'auto_fit_preview_count')
 
         auto_text_key = f"{text_key}_af_{int(time.time())}"
         context.bot_data['texts'][auto_text_key] = user_text
         context.bot_data['text_settings'][auto_text_key] = deepcopy(auto_settings)
-        context.bot_data['preview_images'][auto_text_key] = raw_preview_bytes
+        context.bot_data['preview_images'][auto_text_key] = clean_auto_preview_bytes
         context.bot_data['preview_meta'][auto_text_key] = {
             'created_at': time.time(),
             'user_id': user_id
@@ -1755,227 +2642,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_preview_reply_markup(auto_text_key, auto_settings)
         )
         return
-
-    if data.startswith("fs:"):
-        cleanup_expired_preview_cache(context)
-        _, action, result_key = data.split(":", 2)
-        settings = get_user_settings(context, user_id)
-        final_payload = context.bot_data.get('final_images', {}).get(result_key)
-
-        if not final_payload:
-            await query.message.reply_text(
-                "Final output not found. Please generate it again."
-            )
-            return
-
-        if action == "reset":
-            settings['preview_template_offset_y'] = 0
-        else:
-            settings['preview_template_offset_y'] = settings.get('preview_template_offset_y', 0) + int(action)
-
-        layout_png = apply_preview_layout(final_payload['raw_png'], settings)
-        output_format = final_payload['output_format']
-
-        if output_format == "layoutpdf":
-            output_bytes = convert_png_bytes_to_pdf_bytes(layout_png)
-            await query.message.reply_document(
-                document=output_bytes,
-                filename=f"handwritten_{final_payload['page_size']}_{final_payload['dpi']}dpi.pdf",
-                caption=(
-                    "Updated final PDF\n\n"
-                    f"Template shift: {settings.get('preview_template_offset_y', 0):+d}px"
-                )
-            )
-        else:
-            output_jpg = convert_png_bytes_to_jpg_bytes(layout_png)
-            await query.message.reply_photo(
-                photo=output_jpg,
-                caption=(
-                    "Updated final PNG\n\n"
-                    f"Template shift: {settings.get('preview_template_offset_y', 0):+d}px"
-                )
-            )
-            await query.message.reply_document(
-                document=layout_png,
-                filename=f"handwritten_{final_payload['page_size']}_{final_payload['dpi']}dpi.png",
-                caption=f"PNG file\n\n{final_payload['page_size'].upper()}, {final_payload['dpi']} DPI"
-            )
-
-        await query.edit_message_text(
-            build_final_shift_text(settings, output_format),
-            reply_markup=build_final_shift_reply_markup(result_key)
-        )
-        return
-    
-    if data.startswith("fullselect:"):
-        text_key = data.replace("fullselect:", "")
-        settings = deepcopy(context.bot_data.get('text_settings', {}).get(text_key, get_user_settings(context, user_id)))
-        if settings.get('preview_layout') == 'plain':
-            keyboard = [
-                [InlineKeyboardButton("PNG", callback_data=f"fullrun:png:{text_key}")],
-                [InlineKeyboardButton("PDF", callback_data=f"fullrun:pdf:{text_key}")]
-            ]
-            caption = "Choose a format:\n\nPNG - white background, plus a raw transparent PNG\nPDF - white background, plus a raw transparent PNG"
-        else:
-            layout_name = get_preview_layout_name(settings.get('preview_layout'))
-            keyboard = [
-                [InlineKeyboardButton(f"{layout_name} PNG", callback_data=f"fullrun:layoutpng:{text_key}")],
-                [InlineKeyboardButton(f"{layout_name} PDF", callback_data=f"fullrun:layoutpdf:{text_key}")]
-            ]
-            caption = f"Choose the final format:\n\nPNG - with {layout_name}\nPDF - with {layout_name}"
-        await query.edit_message_caption(
-            caption=caption,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-
-    if data.startswith("full:"):
-        text_key = data.replace("full:", "")
-        settings = deepcopy(context.bot_data.get('text_settings', {}).get(text_key, get_user_settings(context, user_id)))
-        if settings.get('preview_layout') == 'plain':
-            keyboard = [
-                [InlineKeyboardButton("PNG", callback_data=f"fullrun:png:{text_key}")],
-                [InlineKeyboardButton("PDF", callback_data=f"fullrun:pdf:{text_key}")]
-            ]
-            caption = "Choose a format:\n\nPNG - white background, plus a raw transparent PNG\nPDF - white background, plus a raw transparent PNG"
-        else:
-            layout_name = get_preview_layout_name(settings.get('preview_layout'))
-            keyboard = [
-                [InlineKeyboardButton(f"{layout_name} PNG", callback_data=f"fullrun:layoutpng:{text_key}")],
-                [InlineKeyboardButton(f"{layout_name} PDF", callback_data=f"fullrun:layoutpdf:{text_key}")]
-            ]
-            caption = f"Choose the final format:\n\nPNG - with {layout_name}\nPDF - with {layout_name}"
-        await query.edit_message_caption(
-            caption=caption,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-
-    if data.startswith("fullrun:"):
-        cleanup_expired_preview_cache(context)
-        if not is_final_render_enabled(context):
-            await query.message.reply_text(
-                "Final rendering is temporarily disabled. Please try again later."
-            )
-            return
-        _, output_format, text_key = data.split(":", 2)
-        user_text = context.bot_data.get('texts', {}).get(text_key)
-        
-        if not user_text:
-            await query.message.reply_text(
-                "Sorry, the text was not found. Please send it again."
-            )
-            return
-        
-        # API key ni olish
-        api_key = os.getenv('HANTEXT_API_KEY')
-        if not api_key:
-            await query.message.reply_text(
-                "The bot is not configured. Please contact the administrator."
-            )
-            return
-        
-        # "Sending photo..." ko'rsatish
-        await query.message.chat.send_action("upload_photo")
-        
-        try:
-            # Foydalanuvchining sozlamalarini olish
-            user_id = query.from_user.id
-            settings = deepcopy(context.bot_data.get('text_settings', {}).get(text_key, get_user_settings(context, user_id)))
-            settings['dpi'] = 600
-            raw_full_png = None
-
-            layout_output = output_format in ("layoutpng", "layoutpdf")
-            pdf_output = output_format in ("pdf", "layoutpdf")
-            settings['output_format'] = 'png'
-            final_settings = get_effective_generate_settings(settings)
-            
-            # To'liq sifatli rasm yaratish: production uchun har doim bitta raw PNG olamiz.
-            result = text_to_handwritten_image(user_text, api_key, settings)
-            increment_stat(context, 'final_generate_count')
-            raw_full_png = result['data']
-
-            if layout_output:
-                layout_png = apply_preview_layout(raw_full_png, settings)
-                result_key = f"{user_id}_{text_key}_{int(time.time())}"
-                if not context.bot_data.get('final_images'):
-                    context.bot_data['final_images'] = {}
-                if not context.bot_data.get('final_meta'):
-                    context.bot_data['final_meta'] = {}
-                context.bot_data['final_images'][result_key] = {
-                    'raw_png': raw_full_png,
-                    'output_format': output_format,
-                    'page_size': final_settings['page_size'],
-                    'dpi': final_settings['dpi']
-                }
-                context.bot_data['final_meta'][result_key] = {
-                    'created_at': time.time(),
-                    'user_id': user_id
-                }
-                if pdf_output:
-                    result = {'type': 'pdf', 'data': convert_png_bytes_to_pdf_bytes(layout_png)}
-                else:
-                    result = {'type': 'png', 'data': layout_png}
-            elif pdf_output:
-                result = {'type': 'pdf', 'data': convert_png_bytes_to_pdf_bytes(raw_full_png)}
-            else:
-                result = {'type': 'png', 'data': raw_full_png}
-            
-            # PDF yoki PNG yuborish
-            if result['type'] == 'pdf':
-                await query.message.reply_document(
-                    document=result['data'],
-                    filename=f"handwritten_{final_settings['page_size']}_{final_settings['dpi']}dpi.pdf",
-                    caption=f"Done! PDF file\n\n{final_settings['page_size'].upper()}, {final_settings['dpi']} DPI"
-                )
-                if raw_full_png:
-                    await query.message.reply_document(
-                        document=raw_full_png,
-                        filename=f"handwritten_raw_{final_settings['page_size']}_{final_settings['dpi']}dpi.png",
-                        caption=f"Raw PNG (without layout)\n\n{final_settings['page_size'].upper()}, {final_settings['dpi']} DPI"
-                    )
-                if layout_output:
-                    await query.message.reply_text(
-                        build_final_shift_text(settings, output_format),
-                        reply_markup=build_final_shift_reply_markup(result_key)
-                    )
-            else:
-                png_output_bytes = result['data']
-                png_filename = f"handwritten_{final_settings['page_size']}_{final_settings['dpi']}dpi.png"
-                png_caption = f"Done! PNG image\n\n{final_settings['page_size'].upper()}, {final_settings['dpi']} DPI"
-
-                if not layout_output and output_format == 'png':
-                    png_output_bytes = convert_png_bytes_to_white_png_bytes(raw_full_png)
-                    png_caption = f"Done! White-background PNG\n\n{final_settings['page_size'].upper()}, {final_settings['dpi']} DPI"
-
-                await query.message.reply_document(
-                    document=png_output_bytes,
-                    filename=png_filename,
-                    caption=png_caption
-                )
-                if not layout_output and raw_full_png:
-                    await query.message.reply_document(
-                        document=raw_full_png,
-                        filename=f"handwritten_raw_{final_settings['page_size']}_{final_settings['dpi']}dpi.png",
-                        caption=f"Raw PNG (transparent)\n\n{final_settings['page_size'].upper()}, {final_settings['dpi']} DPI"
-                    )
-                if layout_output:
-                    await query.message.reply_document(
-                        document=raw_full_png,
-                        filename=f"handwritten_raw_{final_settings['page_size']}_{final_settings['dpi']}dpi.png",
-                        caption=f"Raw PNG (without layout)\n\n{final_settings['page_size'].upper()}, {final_settings['dpi']} DPI"
-                    )
-                    await query.message.reply_text(
-                        build_final_shift_text(settings, output_format),
-                        reply_markup=build_final_shift_reply_markup(result_key)
-                    )
-            
-        except Exception as e:
-            logger.error(f"Error while creating the full-quality image: {e}")
-            await query.message.reply_text(
-                f"Sorry, an error occurred: {str(e)}\n\n"
-                "Please try again."
-            )
 
 # Error handler
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2031,12 +2697,18 @@ def configure_handlers(application):
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_menu))
     application.add_handler(CommandHandler("stats", admin_stats))
-    application.add_handler(CommandHandler("final", admin_final_control))
+    application.add_handler(CommandHandler("addcredit", admin_add_credit))
+    application.add_handler(CommandHandler("balance", show_balance))
+    application.add_handler(CommandHandler("buy", buy_menu))
+    application.add_handler(CommandHandler("synccommands", sync_commands))
     application.add_handler(CommandHandler(["set", "settings"], settings_menu))
     application.add_handler(CommandHandler("font", set_font))
     application.add_handler(CommandHandler("size", set_size))
     application.add_handler(CommandHandler("fonts", show_fonts))
     application.add_handler(CommandHandler("color", set_color))
+    application.add_handler(CommandHandler("aiedit", ai_edit_image))
+    application.add_handler(MessageHandler(filters.PHOTO, remember_latest_image))
+    application.add_handler(MessageHandler(filters.Document.IMAGE, remember_latest_image))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_error_handler(error_handler)
@@ -2095,6 +2767,7 @@ async def run_webhook_mode(token):
     logger.info(f"Bot starting in webhook mode on port {port} with URL {webhook_url}")
     await application.initialize()
     await application.start()
+    await ensure_bot_commands(application)
     await application.bot.set_webhook(
         url=webhook_url,
         allowed_updates=Update.ALL_TYPES,
@@ -2129,6 +2802,7 @@ def main():
         application = (
             Application.builder()
             .token(TOKEN)
+            .post_init(ensure_bot_commands)
             .read_timeout(60)
             .write_timeout(60)
             .connect_timeout(30)
